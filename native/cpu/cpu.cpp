@@ -21,16 +21,32 @@
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXCore/Utils/LogManager.h>
 
+#ifndef __APPLE__
 #include <asm/sigcontext.h>
+#endif
 #include <cerrno>
 #include <cstring>
 #include <string>
 #include <sys/mman.h>
+#include <unistd.h>
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #include "hw/xbox/hle/prop.h"
+#else
+#define PROP_VALUE_MAX 92
 #endif
+#include <signal.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h> /* the type only: <ucontext.h> wants the deprecated routines */
+#else
 #include <ucontext.h>
+#endif
+
+/* The host page: guard pages must be whole ones (16 KiB on Apple silicon). */
+static size_t HostPage() {
+  static const size_t Page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  return Page;
+}
 
 static_assert(NC_SYSOP_CPUID == static_cast<int>(FEXCore::Core::SystemOpKind::Cpuid));
 static_assert(NC_SYSOP_OTHER == static_cast<int>(FEXCore::Core::SystemOpKind::Other));
@@ -355,12 +371,12 @@ extern "C" NcCpu* nc_cpu_create(const NcCpuConfig* cfg, uint32_t fs_base) {
 
   // Call-ret stack with a guard page on each side, as FEX's front ends do.
   constexpr size_t CRS = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
-  void* Map = mmap(nullptr, CRS + 2 * NC_PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (Map == MAP_FAILED || mprotect(static_cast<uint8_t*>(Map) + NC_PAGE, CRS, PROT_READ | PROT_WRITE) != 0) {
+  void* Map = mmap(nullptr, CRS + 2 * HostPage(), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (Map == MAP_FAILED || mprotect(static_cast<uint8_t*>(Map) + HostPage(), CRS, PROT_READ | PROT_WRITE) != 0) {
     nc_log("hakuX-native", "cpu: no call-ret stack (%s)", strerror(errno));
     return nullptr;
   }
-  cpu->Thread->CallRetStackBase = static_cast<uint8_t*>(Map) + NC_PAGE;
+  cpu->Thread->CallRetStackBase = static_cast<uint8_t*>(Map) + HostPage();
   S.callret_sp = reinterpret_cast<uint64_t>(cpu->Thread->CallRetStackBase) + CRS / 4;
 
   // Flat 32-bit segments everywhere; selector 0x28 is FS at the KPCR. LDT mirrors the GDT.
@@ -519,6 +535,30 @@ extern "C" bool nc_cpu_sample_pc(NcCpu* cpu, uintptr_t host_pc, uint32_t* eip) {
   return jit;
 }
 
+// The host signal frame: Linux keeps the FP/SIMD registers and the fault's ESR in
+// records of its extension area, Darwin in the machine context's own fields.
+#ifdef __APPLE__
+static uint64_t& HostPC(ucontext_t* uc) {
+  return uc->uc_mcontext->__ss.__pc;
+}
+static uint64_t& HostSP(ucontext_t* uc) {
+  return uc->uc_mcontext->__ss.__sp;
+}
+// x0-x28, then fp and lr: 31 registers in a row, as FEX wants them.
+static uint64_t* HostRegs(ucontext_t* uc) {
+  static_assert(offsetof(__darwin_arm_thread_state64, __fp) == 29 * 8 && offsetof(__darwin_arm_thread_state64, __lr) == 30 * 8);
+  return uc->uc_mcontext->__ss.__x;
+}
+static uint64_t HostPState(const ucontext_t* uc) {
+  return uc->uc_mcontext->__ss.__cpsr;
+}
+static const void* HostVReg(const ucontext_t* uc, unsigned i) {
+  return &uc->uc_mcontext->__ns.__v[i];
+}
+static bool HostFaultIsWrite(const ucontext_t* uc) {
+  return (uc->uc_mcontext->__es.__esr >> 6) & 1; // ISS.WnR of a data abort
+}
+#else
 // A record of the host signal frame's extension area (fpsimd_context, esr_context).
 static const _aarch64_ctx* SigRecord(const ucontext_t* uc, uint32_t Magic) {
   const auto* Area = reinterpret_cast<const uint8_t*>(uc->uc_mcontext.__reserved);
@@ -534,10 +574,30 @@ static const _aarch64_ctx* SigRecord(const ucontext_t* uc, uint32_t Magic) {
   }
   return nullptr;
 }
+static uint64_t& HostPC(ucontext_t* uc) {
+  return uc->uc_mcontext.pc;
+}
+static uint64_t& HostSP(ucontext_t* uc) {
+  return uc->uc_mcontext.sp;
+}
+static uint64_t* HostRegs(ucontext_t* uc) {
+  return reinterpret_cast<uint64_t*>(uc->uc_mcontext.regs);
+}
+static uint64_t HostPState(const ucontext_t* uc) {
+  return uc->uc_mcontext.pstate;
+}
+static const void* HostVReg(const ucontext_t* uc, unsigned i) {
+  const auto* Fp = reinterpret_cast<const fpsimd_context*>(SigRecord(uc, FPSIMD_MAGIC));
+  return Fp ? &Fp->vregs[i] : nullptr;
+}
+static bool HostFaultIsWrite(const ucontext_t* uc) {
+  const auto* Esr = reinterpret_cast<const esr_context*>(SigRecord(uc, ESR_MAGIC));
+  return Esr && (Esr->esr >> 6) & 1; // ISS.WnR of a data abort
+}
+#endif
 
 extern "C" bool nc_cpu_fault_is_write(const void* ucontext) {
-  const auto* Esr = reinterpret_cast<const esr_context*>(SigRecord(static_cast<const ucontext_t*>(ucontext), ESR_MAGIC));
-  return Esr && (Esr->esr >> 6) & 1; // ISS.WnR of a data abort
+  return HostFaultIsWrite(static_cast<const ucontext_t*>(ucontext));
 }
 
 // As FEX's front ends do before they deliver a guest signal: the guest PC from the
@@ -545,24 +605,22 @@ extern "C" bool nc_cpu_fault_is_write(const void* ucontext) {
 extern "C" NcFrame* nc_cpu_fault_frame(NcCpu* cpu, void* ucontext) {
   auto* Thread = cpu ? cpu->Thread : nullptr;
   auto* uc = static_cast<ucontext_t*>(ucontext);
-  if (!Thread || !cpu->CTX->IsAddressInCodeBuffer(Thread, uc->uc_mcontext.pc) || Thread->CurrentFrame->InSyscallInfo) {
+  if (!Thread || !cpu->CTX->IsAddressInCodeBuffer(Thread, HostPC(uc)) || Thread->CurrentFrame->InSyscallInfo) {
     return nullptr;
   }
-  const auto* Fp = reinterpret_cast<const fpsimd_context*>(SigRecord(uc, FPSIMD_MAGIC));
-  if (!Fp) {
+  if (!HostVReg(uc, 0)) {
     return nullptr;
   }
   const auto& Config = cpu->Sig.GetConfig();
   auto& S = Thread->CurrentFrame->State;
-  S.rip = cpu->CTX->RestoreRIPFromHostPC(Thread, uc->uc_mcontext.pc);
+  S.rip = cpu->CTX->RestoreRIPFromHostPC(Thread, HostPC(uc));
   for (size_t i = 0; i < Config.SRAGPRCount; i++) {
-    S.gregs[i] = uc->uc_mcontext.regs[Config.SRAGPRMapping[i]];
+    S.gregs[i] = HostRegs(uc)[Config.SRAGPRMapping[i]];
   }
   for (size_t i = 0; i < Config.SRAFPRCount; i++) {
-    memcpy(&S.xmm.sse.data[i][0], &Fp->vregs[Config.SRAFPRMapping[i]], sizeof(__uint128_t));
+    memcpy(&S.xmm.sse.data[i][0], HostVReg(uc, Config.SRAFPRMapping[i]), sizeof(__uint128_t));
   }
-  const uint32_t EFlags = cpu->CTX->ReconstructCompactedEFLAGS(
-    Thread, true, reinterpret_cast<const uint64_t*>(uc->uc_mcontext.regs), uc->uc_mcontext.pstate);
+  const uint32_t EFlags = cpu->CTX->ReconstructCompactedEFLAGS(Thread, true, HostRegs(uc), HostPState(uc));
   cpu->CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
   return reinterpret_cast<NcFrame*>(Thread->CurrentFrame);
 }
@@ -570,28 +628,33 @@ extern "C" NcFrame* nc_cpu_fault_frame(NcCpu* cpu, void* ucontext) {
 // Back to the dispatcher's loop top on its own stack, which refills the registers
 // from the frame and runs from its EIP.
 extern "C" void nc_cpu_fault_resume(NcCpu* cpu, void* ucontext) {
-  auto& mc = static_cast<ucontext_t*>(ucontext)->uc_mcontext;
-  mc.pc = cpu->Sig.GetConfig().AbsoluteLoopTopAddressFillSRA;
-  mc.sp = cpu->Thread->CurrentFrame->ReturningStackLocation;
-  mc.regs[1] = 0; // ENTRY_FILL_SRA_SINGLE_INST_REG: a normal block
+  auto* uc = static_cast<ucontext_t*>(ucontext);
+  HostPC(uc) = cpu->Sig.GetConfig().AbsoluteLoopTopAddressFillSRA;
+  HostSP(uc) = cpu->Thread->CurrentFrame->ReturningStackLocation;
+  HostRegs(uc)[1] = 0; // ENTRY_FILL_SRA_SINGLE_INST_REG: a normal block
 }
 
 // As FEX's Linux front end does (SignalDelegator's SIGBUS handler): ARMv8.0-8.3
 // atomics fault on an address their size doesn't divide, where x86's locked
 // instructions don't. FEX emulates the access, or backpatches a load/store to a
 // plain one, and says how far the PC moves. TSO is off: plain accesses then.
+// Darwin's si_code for these isn't BUS_ADRALN reliably: FEX's decoder decides.
 extern "C" bool nc_cpu_unaligned_fault(NcCpu* cpu, int code, void* ucontext) {
   auto* uc = static_cast<ucontext_t*>(ucontext);
-  if (code != BUS_ADRALN || !cpu || !cpu->Thread || !cpu->CTX->IsAddressInCodeBuffer(cpu->Thread, uc->uc_mcontext.pc)) {
+#ifndef __APPLE__
+  if (code != BUS_ADRALN) {
+    return false;
+  }
+#endif
+  if (!cpu || !cpu->Thread || !cpu->CTX->IsAddressInCodeBuffer(cpu->Thread, HostPC(uc))) {
     return false;
   }
   const auto Moved = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
-    cpu->Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic, uc->uc_mcontext.pc,
-    reinterpret_cast<uint64_t*>(uc->uc_mcontext.regs));
+    cpu->Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic, HostPC(uc), HostRegs(uc));
   if (!Moved) {
     return false;
   }
-  uc->uc_mcontext.pc += *Moved;
+  HostPC(uc) += *Moved;
   return true;
 }
 
@@ -601,10 +664,10 @@ extern "C" bool nc_cpu_callret_fault(NcCpu* cpu, uintptr_t fault_addr, void* uco
   }
   constexpr size_t CRS = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
   const uintptr_t Base = reinterpret_cast<uintptr_t>(cpu->Thread->CallRetStackBase);
-  if (fault_addr < Base - NC_PAGE || fault_addr >= Base + CRS + NC_PAGE) {
+  if (fault_addr < Base - HostPage() || fault_addr >= Base + CRS + HostPage()) {
     return false;
   }
   // REG_CALLRET_SP (x25) back to the default location, leaving room both ways.
-  static_cast<ucontext_t*>(ucontext)->uc_mcontext.regs[25] = Base + CRS / 4;
+  HostRegs(static_cast<ucontext_t*>(ucontext))[25] = Base + CRS / 4;
   return true;
 }

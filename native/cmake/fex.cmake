@@ -47,8 +47,10 @@ if(NOT TARGET nc_fex)
   add_library(nc_fex STATIC
     "${HAKUX_FEX_DIR}/Source/Common/HostFeatures.cpp"
     "${HAKUX_FEX_DIR}/Source/Common/CPUInfo.cpp"
-    "${HAKUX_FEX_DIR}/Source/Common/Linux/LinuxVersion.cpp"
   )
+  if(NOT APPLE)
+    target_sources(nc_fex PRIVATE "${HAKUX_FEX_DIR}/Source/Common/Linux/LinuxVersion.cpp")
+  endif()
   target_compile_features(nc_fex PUBLIC cxx_std_20)
   target_include_directories(nc_fex PUBLIC
     "${HAKUX_FEX_DIR}/Source"
@@ -60,5 +62,8 @@ if(NOT TARGET nc_fex)
     ARCHITECTURE_arm64=1 _LARGEFILE64_SOURCE
     "FEX_PRESERVE_ALL_ATTR=__attribute__((preserve_all))" FEX_HAS_PRESERVE_ALL_ATTR=1
   )
-  target_link_libraries(nc_fex PUBLIC FEXCore FEXCore_Base JemallocLibs FEXHeaderUtils range-v3::range-v3 log)
+  target_link_libraries(nc_fex PUBLIC FEXCore FEXCore_Base JemallocLibs FEXHeaderUtils range-v3::range-v3)
+  if(ANDROID)
+    target_link_libraries(nc_fex PUBLIC log)
+  endif()
 endif()
