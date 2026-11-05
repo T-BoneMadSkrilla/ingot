@@ -143,6 +143,20 @@ code {
   font-size: 15px;
 }
 
+.story {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 40px 0 80px;
+  border-top: 1px solid var(--line);
+}
+.story h2 { font-size: 32px; letter-spacing: -0.02em; margin: 0 0 16px; }
+.story h3 { font-size: 21px; margin: 36px 0 10px; }
+.story p, .story li { color: var(--dim); }
+.story ul { padding-left: 22px; }
+.story li { margin-bottom: 12px; }
+.story li strong { color: var(--text); }
+.story li::marker { color: var(--green); }
+
 footer {
   border-top: 1px solid var(--line);
   padding: 28px 24px 40px;

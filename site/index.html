@@ -17,6 +17,7 @@
     <nav>
       <a href="#features">Features</a>
       <a href="#start">Get started</a>
+      <a href="#thanks">Thanks</a>
       <a href="https://github.com/T-BoneMadSkrilla/ingot">GitHub</a>
     </nav>
   </header>
@@ -49,10 +50,6 @@
         <h3>No BIOS needed</h3>
         <p>Ingot reimplements the Xbox kernel itself. No BIOS, MCPX ROM or hard disk image to hunt down, just your game.</p>
       </article>
-      <article>
-        <h3>A real Mac app</h3>
-        <p>A SwiftUI game library with cover art, controller support and Core Audio sound. Double-click a game to play.</p>
-      </article>
     </section>
 
     <section id="start" class="start">
@@ -60,10 +57,25 @@
       <ol>
         <li><strong>Download</strong> Ingot and drag it to your Applications folder.</li>
         <li><strong>Open it.</strong> The app isn't notarized yet, so macOS will block it the first time. Go to <em>System Settings → Privacy &amp; Security</em> and click <em>Open Anyway</em> (on macOS 14 you can also right-click Ingot and choose <em>Open</em>).</li>
-        <li><strong>Add your games.</strong> Put your ISO or XISO disc images in <code>~/Documents/xbox</code>, or add a folder in Settings.</li>
+        <li><strong>Add your games.</strong> Point Ingot to the folder with your ISO or XISO files, something like <code>~/Documents/xbox</code>. Use <em>Add Game Folder…</em> in the library or in Settings.</li>
         <li><strong>Play.</strong> Double-click a game in the library.</li>
       </ol>
       <p class="note">Ingot doesn't include any games or copyrighted Xbox software. Use images dumped from discs you own.</p>
+    </section>
+
+    <section id="thanks" class="story">
+      <h2>A huge thank you to rfandango</h2>
+      <p>Ingot exists because of <a href="https://github.com/rfandango">rfandango</a> and <a href="https://github.com/rfandango/hakuX">hakuX</a>. He built a fast, accurate original Xbox emulator for Android: a JIT built on FEX, a from-scratch reimplementation of the Xbox kernel, and an NV2A renderer that turns the game's GPU commands into Vulkan. Without that work I would never have attempted any of this. Everything Ingot does stands on top of his.</p>
+
+      <h3>Why it has a different name</h3>
+      <p>I thought this was going to be as easy as forking hakuX and slapping a Metal backend on it. It wasn't. Getting games to run well on a Mac meant changing a lot more than the renderer:</p>
+      <ul>
+        <li><strong>A new renderer.</strong> Macs don't have Vulkan, so the GPU side was rewritten for Metal, including generators that turn the Xbox's shaders into Metal shaders. That also meant fixing things Vulkan on Android got for free, like depth precision (Ingot uses reverse-Z) and how textures are uploaded to the GPU.</li>
+        <li><strong>Different memory pages.</strong> The Xbox uses 4 KiB memory pages; Apple silicon uses 16 KiB. One Mac page covers four Xbox pages, so the way game memory is mapped and protected had to be reworked from the ground up.</li>
+        <li><strong>The JIT on macOS.</strong> FEX had to be made to build and run on macOS, and some of its assumptions about the operating system don't hold there. One of them caused crashes after about half an hour of play.</li>
+        <li><strong>A Mac app around it.</strong> The Android app was replaced with a native Mac game library, a Cocoa game window, controller input through Apple's GameController framework, and Core Audio sound.</li>
+      </ul>
+      <p>With that much changed, it isn't fair to call it hakuX, or to send its bugs his way. hakuX's author doesn't support Ingot, so please report Ingot problems on <a href="https://github.com/T-BoneMadSkrilla/ingot/issues">Ingot's GitHub</a>, not upstream. And if you enjoy Ingot, go give <a href="https://github.com/rfandango/hakuX">hakuX</a> a star.</p>
     </section>
   </main>
 
