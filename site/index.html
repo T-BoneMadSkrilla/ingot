@@ -40,15 +40,15 @@
     <section id="features" class="features">
       <article>
         <h3>Built for Metal</h3>
-        <p>The Xbox's GPU commands are translated straight to Metal, no translation layers. Games render at up to 4× native resolution.</p>
+        <p>Metal is Apple's own graphics technology, the way Mac apps talk to the graphics chip. Ingot draws every game with it directly, at up to 4× the Xbox's original resolution.</p>
       </article>
       <article>
-        <h3>Fast x86 JIT</h3>
-        <p>Game code is recompiled to ARM64 on the fly by a FEX-based JIT, with Xbox memory mapped directly onto Apple silicon's 16 KiB pages.</p>
+        <h3>Native on Apple silicon</h3>
+        <p>The Xbox ran on an Intel processor, but your Mac's M-series chip is built on ARM, a different design that speaks a different language. Ingot translates each game into ARM code as it plays.</p>
       </article>
       <article>
         <h3>No BIOS needed</h3>
-        <p>Ingot reimplements the Xbox kernel itself. No BIOS, MCPX ROM or hard disk image to hunt down, just your game.</p>
+        <p>Ingot recreates the Xbox's built-in system software itself, so there's no BIOS or other console files to hunt down. Just bring your game.</p>
       </article>
     </section>
 
@@ -65,22 +65,23 @@
 
     <section id="thanks" class="story">
       <h2>A huge thank you to rfandango</h2>
-      <p>Ingot exists because of <a href="https://github.com/rfandango">rfandango</a> and <a href="https://github.com/rfandango/hakuX">hakuX</a>. He built a fast, accurate original Xbox emulator for Android: a JIT built on FEX, a from-scratch reimplementation of the Xbox kernel, and an NV2A renderer that turns the game's GPU commands into Vulkan. Without that work I would never have attempted any of this. Everything Ingot does stands on top of his.</p>
+      <p>Ingot exists because of <a href="https://github.com/rfandango">rfandango</a> and his emulator, <a href="https://github.com/rfandango/hakuX">hakuX</a>, which plays original Xbox games on Android phones. He did the hard part: recreating the Xbox's processor, its system software and its graphics chip well enough that games run fast and look right. Without hakuX I would never have attempted any of this. Everything Ingot does stands on top of his work.</p>
+      <p>And a big thank you to the <a href="https://xemu.app">xemu</a> team too. hakuX grew out of xemu, the original Xbox emulator for Windows, macOS and Linux, and Ingot's sound still comes from xemu's recreation of the Xbox's audio chip. Years of their research into how the Xbox works are in here.</p>
 
       <h3>Why it has a different name</h3>
-      <p>I thought this was going to be as easy as forking hakuX and slapping a Metal backend on it. It wasn't. Getting games to run well on a Mac meant changing a lot more than the renderer:</p>
+      <p>I thought this was going to be as easy as forking hakuX (making my own copy of its code) and slapping a Metal backend on it. It wasn't. Getting games to run well on a Mac meant changing a lot more than that:</p>
       <ul>
-        <li><strong>A new renderer.</strong> Macs don't have Vulkan, so the GPU side was rewritten for Metal, including generators that turn the Xbox's shaders into Metal shaders. That also meant fixing things Vulkan on Android got for free, like depth precision (Ingot uses reverse-Z) and how textures are uploaded to the GPU.</li>
-        <li><strong>Different memory pages.</strong> The Xbox uses 4 KiB memory pages; Apple silicon uses 16 KiB. One Mac page covers four Xbox pages, so the way game memory is mapped and protected had to be reworked from the ground up.</li>
-        <li><strong>The JIT on macOS.</strong> FEX had to be made to build and run on macOS, and some of its assumptions about the operating system don't hold there. One of them caused crashes after about half an hour of play.</li>
-        <li><strong>A Mac app around it.</strong> The Android app was replaced with a native Mac game library, a Cocoa game window, controller input through Apple's GameController framework, and Core Audio sound.</li>
+        <li><strong>A new way to draw.</strong> Every game's graphics have to be redrawn by your computer's graphics chip. On Android, hakuX does that with Vulkan, a graphics system Macs don't have. Macs use Apple's own, called <em>Metal</em>. So the whole graphics side had to be rewritten for Metal, including translating the Xbox's little graphics programs (shaders) into Metal's language. Along the way came fixes for problems Android never had, like flickering ground in sports games and slowdowns from loading textures.</li>
+        <li><strong>Memory comes in different-sized pages.</strong> Computers hand out memory in fixed-size blocks called <em>pages</em>, a bit like a notebook where you can only lock or unlock a whole sheet at a time. The Xbox uses small 4 KB pages; Apple silicon Macs use pages four times bigger, 16 KB. When the emulator needs to watch or protect one Xbox page, the Mac can only lock the whole big page, which drags three of its neighbours along with it. Making that work, and fast, meant rebuilding how the emulator lays out and guards the game's memory.</li>
+        <li><strong>A different kind of processor.</strong> A processor only understands instructions written for its <em>architecture</em>, its "native language." The Xbox has an Intel Pentium III, which speaks x86, the same family as most Windows PCs. Apple silicon Macs, like most phones and tablets, are built on ARM, which speaks a completely different language. So a game's code can't just run on a Mac: it has to be translated from x86 into ARM while you play. hakuX does that with a translator called FEX, and because Android phones are ARM too, that part was already a great fit. But FEX was made for Linux, and it had to be taught to run on macOS, where a few things behave differently. One of those differences made games crash after about half an hour of play until it was tracked down.</li>
+        <li><strong>A real Mac app around it.</strong> The Android app was replaced with a Mac game library, a Mac game window, support for Xbox, PlayStation and other Mac controllers, and Mac sound output.</li>
       </ul>
-      <p>With that much changed, it isn't fair to call it hakuX, or to send its bugs his way. hakuX's author doesn't support Ingot, so please report Ingot problems on <a href="https://github.com/T-BoneMadSkrilla/ingot/issues">Ingot's GitHub</a>, not upstream. And if you enjoy Ingot, go give <a href="https://github.com/rfandango/hakuX">hakuX</a> a star.</p>
+      <p>With that much changed, it isn't fair to call it hakuX, or to send its bugs his way. hakuX's author doesn't support Ingot, so please report Ingot problems on <a href="https://github.com/T-BoneMadSkrilla/ingot/issues">Ingot's GitHub</a>, not to hakuX. And if you enjoy Ingot, go give <a href="https://github.com/rfandango/hakuX">hakuX</a> and <a href="https://github.com/xemu-project/xemu">xemu</a> a star.</p>
     </section>
   </main>
 
   <footer>
-    <p>Ingot is free software under the <a href="https://www.gnu.org/licenses/gpl-3.0.html">GNU GPL v3</a>, a fork of <a href="https://github.com/rfandango/hakuX">hakuX</a> by rfandango. Audio from <a href="https://xemu.app">xemu</a>.</p>
+    <p>Ingot is free software under the <a href="https://www.gnu.org/licenses/gpl-3.0.html">GNU GPL v3</a>, a fork of <a href="https://github.com/rfandango/hakuX">hakuX</a> by rfandango, which grew out of <a href="https://xemu.app">xemu</a>.</p>
     <p>Not affiliated with Microsoft. “Xbox” is a trademark of Microsoft.</p>
   </footer>
 </body>
