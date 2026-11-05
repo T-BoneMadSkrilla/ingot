@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "hw/xbox/hle/shader/ff.h"
+#include "hw/xbox/hle/shader/msl.h"
 #include "hw/xbox/hle/shader/psh.h"
 
 typedef struct Buf {
@@ -40,6 +41,14 @@ static void put(Buf *b, const char *fmt, ...)
         return;
     }
     b->len += (size_t)n;
+}
+
+static void io(Buf *b, HleMsl *m, bool in, unsigned loc, bool flat, const char *type,
+               const char *name)
+{
+    char line[96];
+    hle_msl_io(m, line, sizeof(line), in, loc, flat, type, name);
+    put(b, "%s", line);
 }
 
 void hle_psh_key(const uint32_t *rs, HlePshKey *k)
@@ -276,7 +285,6 @@ static void alpha_kill(Buf *b, const HlePshKey *k, unsigned s, unsigned m)
 size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsupported)
 {
     Buf b = { buf, cap, 0, false, "0.5" };
-    const char *interp = k->flat ? "flat " : "";
     /* The combiners compute in signed fixed point, 1.0 = 0xFF: the bias
      * mappings' 0.5 is 0x80, its MSB set, while a halving of 1.0 is 0x7F,
      * clear; both are 0.5 in float. A MUX on r0.a's MSB tells them apart:
@@ -308,22 +316,39 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
     for (unsigned s = 0; s < 3; s++) {
         hilo1 |= ((k->dot_map >> (4 * s)) & 7) == 4;
     }
-    put(&b, "#version 450\n#extension GL_EXT_nonuniform_qualifier : require\n%s",
-        hle_push_glsl());
-    put(&b, "layout(set = 0, binding = 0) uniform texture2D uTex2D[];\n"
-            "layout(set = 0, binding = 1) uniform sampler uSmp[];\n"
-            "layout(set = 0, binding = 2) uniform textureCube uTexCube[];\n"
-            "layout(set = 0, binding = 3) uniform texture3D uTex3D[];\n"
-            "layout(location = 0) %sin vec4 vDiffuse;\n"
-            "layout(location = 1) %sin vec4 vSpecular;\n"
-            "layout(location = 2) in vec4 vTex0;\n"
-            "layout(location = 3) in vec4 vTex1;\n"
-            "layout(location = 4) in vec4 vTex2;\n"
-            "layout(location = 5) in vec4 vTex3i;\n"
-            "layout(location = 6) in float vFog;\n"
-            "%s%s%s"
-            "layout(location = 0) out vec4 oColor;\n"
-            "vec4 col(uint c) { return unpackUnorm4x8(c).zyxw; }\n"
+    HleMsl msl = { .fs = true }, *m = g_hle_msl ? &msl : NULL;
+    if (m) {
+        put(&b, "%s%s", hle_msl_begin(true), hle_msl_tex(m, 7));
+    } else {
+        put(&b, "#version 450\n#extension GL_EXT_nonuniform_qualifier : require\n%s",
+            hle_push_glsl());
+        put(&b, "layout(set = 0, binding = 0) uniform texture2D uTex2D[];\n"
+                "layout(set = 0, binding = 1) uniform sampler uSmp[];\n"
+                "layout(set = 0, binding = 2) uniform textureCube uTexCube[];\n"
+                "layout(set = 0, binding = 3) uniform texture3D uTex3D[];\n");
+    }
+    static const char *const k_vary[7] = {
+        "vDiffuse", "vSpecular", "vTex0", "vTex1", "vTex2", "vTex3i", "vFog",
+    };
+    for (unsigned l = 0; l < 7; l++) {
+        io(&b, m, true, l, k->flat && l < 2, l == 6 ? "float" : "vec4", k_vary[l]);
+    }
+    if (k->wbuf) {
+        io(&b, m, true, 9, false, "float", "vW");
+    }
+    if (m) {
+        m->fb = (k->fbfetch & ~HLE_FB_ZEQ) || k->sblend;
+        m->ptc = k->point_sprite;
+        m->depth = k->wbuf;
+    } else {
+        put(&b, "%s%s",
+            (k->fbfetch & ~HLE_FB_ZEQ) || k->sblend ?
+                "layout(input_attachment_index = 0, set = 2, binding = 0) "
+                "uniform subpassInput uFb;\n" : "",
+            k->fbfetch & HLE_FB_ZEQ ? HLE_ZEQ_DECL_GLSL : "");
+    }
+    io(&b, m, false, 0, false, "vec4", "oColor");
+    put(&b, "vec4 col(uint c) { return unpackUnorm4x8(c).zyxw; }\n"
             HLE_NVPROJ_GLSL
             "%s"
             /* Xbox linear (non-swizzled) textures use texel coordinates */
@@ -362,11 +387,7 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
             "}\n"
             "void main() {\n"
             "  vec4 v0 = vDiffuse, v1 = vSpecular;\n"
-            "  vec4 vTex3 = %s;\n", interp, interp, k->wbuf ? HLE_WBUF_IN_GLSL : "",
-        (k->fbfetch & ~HLE_FB_ZEQ) || k->sblend ?
-            "layout(input_attachment_index = 0, set = 2, binding = 0) "
-            "uniform subpassInput uFb;\n" : "",
-        k->fbfetch & HLE_FB_ZEQ ? HLE_ZEQ_DECL_GLSL : "",
+            "  vec4 vTex3 = %s;\n",
         /* a linear texture kept to its own size (ff.h HLE_NVRECT_GLSL): the stage fog.w names */
         k->vol & HLE_PSH_RECT ? HLE_NVRECT_GLSL : "",
         k->vol & HLE_PSH_RECT ?
@@ -599,7 +620,12 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
         "    ivec4 r = clamp(dv %s sv, ivec4(-128), ivec4(127));\n"
         "    oColor = vec4(r & 255) / 255.0; }\n", "oColor", k->sblend == 1 ? "+" : "-");
     }
-    put(&b, "%s}\n", k->wbuf ? HLE_WBUF_STORE_GLSL : "");
+    put(&b, "%s}\n", k->wbuf ? hle_wbuf_store_glsl() : "");
+    if (m && !b.overflow) {
+        size_t n = hle_msl_entry(m, b.p + b.len, b.cap - b.len);
+        b.overflow |= !n;
+        b.len += n;
+    }
     if (unsupported) {
         *unsupported = unsup;
     }

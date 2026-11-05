@@ -11,8 +11,8 @@
 #include "hw/xbox/hle/pb/pbres.h"
 #include "hw/xbox/hle/tex/xdk_res.h"
 #include "hw/xbox/hle/tex/xg_swizzle.h"
+#include "hw/xbox/hle/gpu.h"
 #include "hw/xbox/hle/vk/back.h"
-#include "hw/xbox/hle/vk/guest_ram.h"
 
 /* ---- arena ------------------------------------------------------------------- */
 
@@ -48,9 +48,9 @@ static uint32_t ring_alloc(HleArena *a, uint32_t len, uint32_t align)
 
 static uint32_t arena_alloc(uint32_t len, uint32_t align, uint8_t **ptr)
 {
-    uint32_t off = ring_alloc(&g_harena.alloc, len, align);
+    uint32_t off = ring_alloc(hle_gpu_arena(), len, align);
     if (off != HLE_ARENA_FULL) {
-        *ptr = g_harena.map + off;
+        *ptr = hle_gpu_arena_map() + off;
     }
     return off;
 }
@@ -298,11 +298,11 @@ static bool tex_define(uint32_t id, const uint32_t h5[5], const HleResDesc *dp,
      * one slice); a volume's levels are depth slices (3D swizzle, or DXT
      * blocks in groups of four slices), depth halving per level */
     bool vol = d.kind == HLE_RK_VOLUME;
-    bool dxtd = (fi->flags & HLE_FI_DXT) && (vol || !g_hvk.caps.bc);
+    bool dxtd = (fi->flags & HLE_FI_DXT) && (vol || !hle_gpu_has_bc());
     /* A4R4G4B4 on a GPU without the 4444 formats: A8R8G8B8 as well (expand_4444),
      * a linear texture a linear one */
     bool x4444 = (d.fmt == HLE_XFMT_A4R4G4B4 || d.fmt == HLE_XFMT_LIN_A4R4G4B4) &&
-                 !g_hvk.caps.x4444;
+                 !hle_gpu_has_4444();
     uint32_t oxfmt = p8 || dxtd ? HLE_XFMT_A8R8G8B8 :
                      x4444 ? (d.fmt == HLE_XFMT_LIN_A4R4G4B4 ? HLE_XFMT_LIN_A8R8G8B8
                                                             : HLE_XFMT_A8R8G8B8) : d.fmt;
@@ -466,8 +466,23 @@ enum {
 enum { VT_POINTS = 0, VT_LINES = 1, VT_LINE_STRIP = 2, VT_TRIS = 3, VT_TRI_STRIP = 4,
        VT_TRI_FAN = 5 };
 
+bool g_hle_no_fans;
+
+static bool fan_list(uint32_t pt)
+{
+    return g_hle_no_fans && (pt == PT_TRIANGLEFAN || pt == PT_POLYGON);
+}
+
+bool hle_draw_prim_converted(uint32_t pt)
+{
+    return pt == PT_QUADLIST || pt == PT_LINELOOP || fan_list(pt);
+}
+
 uint32_t hle_draw_prim_topology(uint32_t pt)
 {
+    if (fan_list(pt)) {
+        return VT_TRIS;
+    }
     switch (pt) {
     case PT_POINTLIST:     return VT_POINTS;
     case PT_LINELIST:      return VT_LINES;
@@ -489,6 +504,9 @@ uint32_t hle_draw_prim_count(uint32_t pt, uint32_t n)
     if (pt == PT_LINELOOP) {
         return n ? n + 1 : 0;
     }
+    if (fan_list(pt)) {
+        return n >= 3 ? (n - 2) * 3 : 0;
+    }
     return n;
 }
 
@@ -500,6 +518,12 @@ void hle_draw_prim_indices(uint32_t pt, const uint16_t *in, uint32_t n, uint32_t
         for (uint32_t q = 0; q + 3 < n; q += 4) {
             *out++ = IN(q); *out++ = IN(q + 1); *out++ = IN(q + 2);
             *out++ = IN(q); *out++ = IN(q + 2); *out++ = IN(q + 3);
+        }
+        return;
+    }
+    if (fan_list(pt)) {
+        for (uint32_t i = 1; i + 1 < n; i++) {
+            *out++ = IN(0); *out++ = IN(i); *out++ = IN(i + 1);
         }
         return;
     }
@@ -532,7 +556,7 @@ void hle_res_upload(uint32_t id, uint32_t pa, uint32_t pitch, uint32_t n,
          * rows, as they are now, through the arena (allocated before the
          * command: a full arena kicks one) */
         uint32_t arena = 0;
-        if ((!g_hram.zero_copy || hle_barrier_contended(clo, chi - clo)) && chi > clo) {
+        if ((!hle_gpu_zero_copy() || hle_barrier_contended(clo, chi - clo)) && chi > clo) {
             uint8_t *dst;
             const uint8_t *src = hle_pa_ptr(clo, chi - clo);
             uint32_t off = src ? hle_draw_arena_alloc(chi - clo, &dst) : HLE_ARENA_FULL;
@@ -567,22 +591,22 @@ void hle_res_upload(uint32_t id, uint32_t pa, uint32_t pitch, uint32_t n,
 uint32_t hle_res_rb_fb(uint32_t len)
 {
     uint8_t *p;
-    if (g_hram.zero_copy || !len) {
+    if (hle_gpu_zero_copy() || !len) {
         return 0;
     }
-    if (!g_hland.buf) {
+    if (!hle_gpu_land()) {
         uint32_t off = hle_draw_arena_alloc(len, &p);
         return off == HLE_ARENA_FULL ? 0 : off + 1;
     }
     /* the landing buffer (host-cached): its space is free again once the
      * GPU passes the value, after the landing read it */
-    uint32_t off = ring_alloc(&g_hland.alloc, len, 256);
+    uint32_t off = ring_alloc(hle_gpu_land(), len, 256);
     return off == HLE_ARENA_FULL ? 0 : off + 1;
 }
 
 bool hle_res_ram_direct(void)
 {
-    return g_hram.zero_copy;
+    return hle_gpu_zero_copy();
 }
 
 uint32_t hle_res_land_alloc(uint32_t len)
@@ -591,7 +615,7 @@ uint32_t hle_res_land_alloc(uint32_t len)
     if (!len) {
         return 0;
     }
-    const uint32_t off = g_hland.buf ? ring_alloc(&g_hland.alloc, len, 256) : hle_draw_arena_alloc(len, &p);
+    const uint32_t off = hle_gpu_land() ? ring_alloc(hle_gpu_land(), len, 256) : hle_draw_arena_alloc(len, &p);
     return off == HLE_ARENA_FULL ? 0 : off + 1;
 }
 

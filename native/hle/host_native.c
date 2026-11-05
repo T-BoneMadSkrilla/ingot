@@ -13,8 +13,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <vulkan/vulkan.h>
-
 HleCpu nc_hle_regs;
 
 static NcVm *g_vm;
@@ -163,27 +161,38 @@ int hle_host_render_scale(void)
 
 /* A custom Vulkan driver's entry point (the app loads Turnip through
  * adrenotools), or the system driver's. */
-static PFN_vkGetInstanceProcAddr g_custom_gipa;
+static void *g_custom_gipa;
 
 void nc_hle_set_vk_loader(void *gipa)
 {
-    g_custom_gipa = (PFN_vkGetInstanceProcAddr)gipa;
+    g_custom_gipa = gipa;
 }
 
 void *hle_host_vk_loader(void)
 {
-    static PFN_vkGetInstanceProcAddr gipa;
+    static void *gipa;
     if (g_custom_gipa) {
-        return (void *)g_custom_gipa;
+        return g_custom_gipa;
     }
     if (!gipa) {
+#ifdef __APPLE__
+        /* the Vulkan loader (MoltenVK under it), else MoltenVK alone */
+        static const char *const names[] = { "libvulkan.1.dylib", "/opt/homebrew/lib/libvulkan.1.dylib",
+                                             "/usr/local/lib/libvulkan.1.dylib", "libMoltenVK.dylib",
+                                             "/opt/homebrew/lib/libMoltenVK.dylib" };
+        void *lib = NULL;
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !lib; i++) {
+            lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+        }
+#else
         void *lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-        gipa = lib ? (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr") : NULL;
+#endif
+        gipa = lib ? dlsym(lib, "vkGetInstanceProcAddr") : NULL;
         if (!gipa) {
             nc_log("hakuX-native-hle", "no Vulkan loader: %s", dlerror());
         }
     }
-    return (void *)gipa;
+    return gipa;
 }
 
 /* The app tells the user and goes back to the library (nc_hle_fatal). */

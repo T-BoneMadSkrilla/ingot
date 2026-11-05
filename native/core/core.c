@@ -6,6 +6,7 @@
 #include "native/dev/usb.h"
 #include "native/hle/hle_native.h"
 #include "native/core/mmio.h"
+#include "native/core/hostctx.h"
 #include "native/core/mods.h"
 #include "native/net/net.h"
 #include "native/state/save.h"
@@ -15,6 +16,17 @@
 #include <strings.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+
+#ifdef NC_VM16K
+extern NcCodeTail fex_code_tail; /* FEXCore's SharedCodeBufferManager */
+static NcCpu *g_jit_cpu;
+
+static bool is_jit_pc(uintptr_t pc)
+{
+    uint32_t eip;
+    return nc_cpu_sample_pc(g_jit_cpu, pc, &eip);
+}
+#endif
 
 #define MAIN_STACK_SIZE (256u * 1024u)
 
@@ -217,6 +229,12 @@ bool nc_core_boot(NcCore *c, int disc_fd)
         return boot_failed("The emulated CPU couldn't start.");
     }
     nc_mods_bind(&c->vm, c->cpu, &c->xbe.info);
+#ifdef NC_VM16K
+    g_jit_cpu = c->cpu;
+    if (!getenv("NC_NO_SITES")) {
+        nc_vm16k_set_jit(is_jit_pc, &fex_code_tail);
+    }
+#endif
 
     uint32_t stack = MAIN_STACK_SIZE;
     if (c->xbe.stack_commit > stack) {
@@ -254,7 +272,9 @@ void nc_core_run(NcCore *c)
     /* The guest thread's short host waits (a Sleep(0) poll that went on, the
      * idle CPU) end when they should: Linux lets a normal thread's timed
      * wait run 50 us late by default. */
+#ifdef PR_SET_TIMERSLACK
     prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
+#endif
     /* a savestate: the thread it was running, or the scheduler first */
     const NcCpuContext *start = g_loaded ? nc_kstate_start_context(&c->kernel) : &g_boot->ctx;
     nc_cpu_run(c->cpu, start ? start : &g_boot->ctx);
@@ -368,7 +388,7 @@ bool nc_core_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext)
     if (sig == SIGILL) {
         return false;
     }
-    const uintptr_t pc = ((ucontext_t *)ucontext)->uc_mcontext.pc;
+    const uintptr_t pc = nc_host_regs(ucontext)->pc;
     if (sig == SIGBUS && nc_cpu_unaligned_fault(c->cpu, info->si_code, ucontext)) {
         /* Doom 3 keeps a critical section at 0x00BFD88E: RtlEnterCriticalSection's
          * lock inc of its LockCount (0x00BFD89E) took the core down */
@@ -382,6 +402,27 @@ bool nc_core_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext)
         __atomic_fetch_add(&g_nc_faults_callret, 1, __ATOMIC_RELAXED);
         return true;
     }
+#ifdef NC_VM16K
+    /* A host page the guest's pages don't map as one: the access made for
+     * it, or the guest's own fault at the first byte its page denies, which
+     * Darwin reports as SIGBUS as often as SIGSEGV. */
+    siginfo_t denied;
+    {
+        uintptr_t at = 0;
+        const int r = nc_vm16k_fault(&c->vm, info, ucontext, &at);
+        if (r == NC_VM16K_DONE) {
+            return true;
+        }
+        if (r == NC_VM16K_DENIED) {
+            denied = *info;
+            denied.si_addr = (void *)at;
+            info = &denied;
+        }
+        if (sig == SIGBUS && nc_vm_guest_of(&c->vm, info->si_addr) != UINT64_MAX) {
+            sig = SIGSEGV;
+        }
+    }
+#endif
     {   /* NC_WATCHPA: a guest store to the watched RAM, with its EIP */
         const uint64_t gva = nc_vm_guest_of(&c->vm, info->si_addr);
         const uint32_t gpa = gva != UINT64_MAX ? nc_vm_phys(&c->vm, (uint32_t)gva) : UINT32_MAX;

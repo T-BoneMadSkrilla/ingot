@@ -9,6 +9,9 @@
 #include "hw/xbox/hle/mem/pageuse.h"
 
 #include <sched.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 static HlePageUse g_pu;
 static uint64_t g_ram;
@@ -137,7 +140,16 @@ void hle_barrier_init(uint64_t ram_size)
     }
     g_nbr_n = g_new0(uint16_t, ram_size >> 12);
     g_nbr_t = g_new0(uint32_t, ram_size >> 12);
-#if defined(__aarch64__)
+#if defined(__APPLE__)
+    {
+        /* CTR_EL0 traps at EL0 on Darwin */
+        uint64_t line = 0;
+        size_t len = sizeof(line);
+        if (sysctlbyname("hw.cachelinesize", &line, &len, NULL, 0) == 0 && line) {
+            g_line = (uint32_t)line;
+        }
+    }
+#elif defined(__aarch64__)
     {
         uint64_t ctr;
         __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));

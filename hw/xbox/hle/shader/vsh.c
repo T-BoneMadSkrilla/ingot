@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "hw/xbox/hle/shader/ff.h"
+#include "hw/xbox/hle/shader/msl.h"
 #include "hw/xbox/hle/shader/vsh.h"
 #include "subprojects/nv2a_vsh_cpu/src/nv2a_vsh_disassembler.h"
 
@@ -38,6 +39,15 @@ static void put(Buf *b, const char *fmt, ...)
         return;
     }
     b->len += (size_t)n;
+}
+
+static void msl_end(Buf *b, const HleMsl *m)
+{
+    if (m && !b->overflow) {
+        size_t n = hle_msl_entry(m, b->p + b->len, b->cap - b->len);
+        b->overflow |= !n;
+        b->len += n;
+    }
 }
 
 /* NV2A output register file: 0 oPos, 3 oD0, 4 oD1, 5 oFog, 6 oPts, 7 oB0,
@@ -198,31 +208,41 @@ static const char k_lib[] =
 
 /* The declarations and main's start: the inputs (v0..v15, current values
  * for registers no array feeds), the outputs, the registers. */
-static void head(Buf *bp, const HleVshKey *k)
+static void io(Buf *b, HleMsl *m, bool in, unsigned loc, bool flat, const char *type,
+               const char *name)
+{
+    char line[96];
+    hle_msl_io(m, line, sizeof(line), in, loc, flat, type, name);
+    put(b, "%s", line);
+}
+
+static void head(Buf *bp, const HleVshKey *k, HleMsl *m)
 {
     Buf b = *bp;
-    const char *interp = k->flat ? "flat " : "";
-    put(&b, "#version 450\n%s", hle_push_glsl());
-    put(&b, "layout(set = 1, binding = 0, std140) uniform VshConst { vec4 c[192]; "
-            "vec4 vcur[16]; };\n"
-            "invariant gl_Position;\n");
+    if (m) {
+        put(&b, "%s%s", hle_msl_begin(false), hle_msl_ubo(m, 1));
+    } else {
+        put(&b, "#version 450\n%s", hle_push_glsl());
+        put(&b, "layout(set = 1, binding = 0, std140) uniform VshConst { vec4 c[192]; "
+                "vec4 vcur[16]; };\n"
+                "invariant gl_Position;\n");
+    }
+    char name[16];
     for (unsigned i = 0; i < 16; i++) {
         if (k->in_mask & (1u << i)) {
-            put(&b, "layout(location = %u) in %s v%u_in;\n", i,
-                (k->cmp_mask >> i) & 1 ? "uvec2" : (k->int_mask >> i) & 1 ? "ivec4" : "vec4", i);
+            snprintf(name, sizeof(name), "v%u_in", i);
+            io(&b, m, true, i, false,
+               (k->cmp_mask >> i) & 1 ? "uvec2" : (k->int_mask >> i) & 1 ? "ivec4" : "vec4", name);
         }
     }
-    put(&b, "layout(location = 0) %sout vec4 vDiffuse;\n"
-            "layout(location = 1) %sout vec4 vSpecular;\n"
-            "layout(location = 2) out vec4 vTex0;\n"
-            "layout(location = 3) out vec4 vTex1;\n"
-            "layout(location = 4) out vec4 vTex2;\n"
-            "layout(location = 5) out vec4 vTex3;\n"
-            "layout(location = 6) out float vFog;\n"
-            "layout(location = 7) %sout vec4 vBack0;\n"
-            "layout(location = 8) %sout vec4 vBack1;\n", interp, interp, interp, interp);
+    static const char *const k_vary[9] = {
+        "vDiffuse", "vSpecular", "vTex0", "vTex1", "vTex2", "vTex3", "vFog", "vBack0", "vBack1",
+    };
+    for (unsigned l = 0; l < 9; l++) {
+        io(&b, m, false, l, k->flat && (l < 2 || l > 6), l == 6 ? "float" : "vec4", k_vary[l]);
+    }
     if (k->wbuf) {      /* W-buffering: perspective-correct w for the depth */
-        put(&b, "layout(location = 9) out float vW;\n");
+        io(&b, m, false, 9, false, "float", "vW");
     }
     put(&b, "%s", k_lib);
     put(&b, "void main() {\n");
@@ -262,7 +282,8 @@ size_t hle_vsh_glsl(const uint32_t *tokens, unsigned nslots, const HleVshKey *k,
                     char *buf, size_t cap)
 {
     Buf b = { buf, cap, 0, false };
-    head(&b, k);
+    HleMsl msl = { .fs = false }, *m = g_hle_msl ? &msl : NULL;
+    head(&b, k, m);
     bool final = false, fogw = false;
     for (unsigned s = 0; s < nslots && s < HLE_VSH_MAX_SLOTS && !final; s++) {
         Nv2aVshStep st;
@@ -298,15 +319,18 @@ size_t hle_vsh_glsl(const uint32_t *tokens, unsigned nslots, const HleVshKey *k,
         return 0;
     }
     tail(&b, k, fogw);
+    msl_end(&b, m);
     return b.overflow ? 0 : b.len;
 }
 
 size_t hle_vsh_glsl_wrap(const HleVshKey *k, const char *body, bool fogw, char *buf, size_t cap)
 {
     Buf b = { buf, cap, 0, false };
-    head(&b, k);
+    HleMsl msl = { .fs = false }, *m = g_hle_msl ? &msl : NULL;
+    head(&b, k, m);
     put(&b, "%s", body);
     tail(&b, k, fogw);
+    msl_end(&b, m);
     return b.overflow ? 0 : b.len;
 }
 
@@ -351,7 +375,7 @@ static void tail(Buf *bp, const HleVshKey *k, bool fogw)
      * must not clip the primitive (Forza's sky dome past the far plane, its
      * minimap at z far below 0), so the clip z only keeps w >= 0. */
     if (!k->wbuf && !k->zfree) {
-        put(&b, HLE_ZNORM_GLSL("oPos.z", "zN"));
+        put(&b, g_hle_glsl_revz ? HLE_ZNORM_REV_GLSL("oPos.z", "zN") : HLE_ZNORM_GLSL("oPos.z", "zN"));
     }
     put(&b, "  gl_Position = vec4(ndc * w, %s, w);\n", k->wbuf || k->zfree ? "0.0" : "zN * w");
     if (k->zclamp && g_hle_glsl_zclamp) {

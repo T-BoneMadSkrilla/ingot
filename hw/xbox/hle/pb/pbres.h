@@ -29,6 +29,11 @@ uint32_t hle_draw_prim_topology(uint32_t pt);
 uint32_t hle_draw_prim_count(uint32_t pt, uint32_t n);
 void hle_draw_prim_indices(uint32_t pt, const uint16_t *in, uint32_t n, uint32_t base,
                            uint16_t *out);
+/* True for the types drawn through converted indices only */
+bool hle_draw_prim_converted(uint32_t pt);
+/* The device draws no triangle fans (Metal, through MoltenVK's portability
+ * subset): fans and polygons become triangle lists. Set at device creation. */
+extern bool g_hle_no_fans;
 
 /* Texels the CPU wrote at pa (linear rows of pitch bytes) into object id's
  * image: rects of source pixels, each to its pts[i] (HLE_OP_UPLOAD). */

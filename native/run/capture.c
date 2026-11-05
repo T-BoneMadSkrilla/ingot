@@ -31,7 +31,9 @@ static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t l
         fwrite(data, 1, len, f);
     }
     uLong crc = crc32(0, (const Bytef *)type, 4);
-    crc = crc32(crc, data, len);
+    if (len) {
+        crc = crc32(crc, data, len); /* with no data zlib returns 0, not crc */
+    }
     uint8_t c[4] = {(uint8_t)(crc >> 24), (uint8_t)(crc >> 16), (uint8_t)(crc >> 8), (uint8_t)crc};
     fwrite(c, 1, 4, f);
 }

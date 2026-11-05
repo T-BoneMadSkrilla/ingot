@@ -12,8 +12,7 @@
 #include "hw/xbox/hle/pb/pbstate.h"
 #include "hw/xbox/hle/vk/back.h"
 #include "hw/xbox/hle/vk/display.h"
-#include "hw/xbox/hle/vk/guest_ram.h"
-#include "hw/xbox/hle/vk/quirks.h"
+#include "hw/xbox/hle/gpu.h"
 #include "hw/xbox/hle/pb/pbres.h"
 #include "hw/xbox/hle/tex/xdk.h"
 #include "hw/xbox/hle/tex/xdk_res.h"
@@ -2819,6 +2818,18 @@ static void drawlog(const HleCmdDraw *d, bool ff)
     if ((polls++ & 255) == 0 && hle_prop_new(&prop, "debug.hakux.pbdraws", v)) {
         g_dlog_left = atoi(v);
     }
+#else
+    /* HAKUX_HLE_PBDRAWS=<swap>,<n>: the n draws from that swap on */
+    static long long at = -2;
+    static int n;
+    if (at == -2) {
+        const char *e = getenv("HAKUX_HLE_PBDRAWS");
+        at = e && sscanf(e, "%lld,%d", &at, &n) == 2 ? at : -1;
+    }
+    if (at >= 0 && g_pd.swaps >= (uint64_t)at) {
+        at = -1;
+        g_dlog_left = n;
+    }
 #endif
     if (g_dlog_left <= 0) {
         return;
@@ -3303,7 +3314,7 @@ static bool vb_in_place(void)
 {
     static int on = -1;
     if (on < 0) {
-        on = g_hram.zero_copy && !getenv("HAKUX_HLE_VB_COPY");
+        on = hle_gpu_zero_copy() && !getenv("HAKUX_HLE_VB_COPY");
     }
     return on;
 }
@@ -3407,12 +3418,22 @@ static uint32_t attr_comp(uint32_t fmt)
     }
 }
 
+/* What an attribute's offset (and its binding's stride) must divide by */
+static uint32_t attr_align(uint32_t fmt)
+{
+    static int words = -1;
+    if (words < 0) {
+        words = hle_gpu_vb_align_words();
+    }
+    return words ? 4 : attr_comp(fmt);
+}
+
 /* HLE_QUIRK_VB_ALIGN: an attribute of binding b (its vertex 0 at base)
  * whose address its components don't divide, at some vertex. */
 static bool vb_misaligned(const HleCmdDraw *d, unsigned b, uint32_t base)
 {
     for (unsigned a = 0; a < HLE_DRAW_ATTRS; a++) {
-        const uint32_t x = d->attr[a], c = attr_comp(x & 0xFF);
+        const uint32_t x = d->attr[a], c = attr_align(x & 0xFF);
         if (((x >> 4) & 0xF) && ((x >> 8) & 0xFF) == b &&
             ((base + (x >> 16)) % c || d->bind_stride[b] % c)) {
             return true;
@@ -3445,7 +3466,7 @@ static bool vb_realign(HleCmdDraw *d, unsigned b, const uint8_t *src, uint32_t f
     }
     uint32_t end = 0;
     for (unsigned i = 0; i < na; i++) {
-        at[i].to = ROUND_UP(end, attr_comp(d->attr[at[i].a] & 0xFF));
+        at[i].to = ROUND_UP(end, attr_align(d->attr[at[i].a] & 0xFF));
         end = at[i].to + at[i].size;
     }
     const uint32_t st = d->bind_stride[b], ns = st ? ROUND_UP(end, 4u) : 0;
@@ -3534,7 +3555,7 @@ static void draw_arrays(void)
         uint32_t len = st ? (hi - lo) * st + MAX(end[b], 1u) : end[b];
         coh_pend_wait(from, len);           /* a copy queued into it lands first */
         const uint8_t *src = hle_pa_ptr(from, len);
-        if (src && hle_quirk(HLE_QUIRK_VB_ALIGN) && vb_misaligned(&d, b, base[b])) {
+        if (src && hle_gpu_vb_align() && vb_misaligned(&d, b, base[b])) {
             if (!vb_realign(&d, b, src, from, len, st ? hi - lo + 1 : 1)) {
                 skip(SK_DRAW_ARRAYS_ARENA);
                 return;
@@ -3570,7 +3591,7 @@ static void draw_arrays(void)
      * snowy town as ~17k short strips a frame, which as indexed draws went to
      * the GPU one by one at ~1.7 us each, and the frame took the GPU 30 ms
      * at 2x (26 fps; 30 at 3x in D3D mode, whose strips were joined). */
-    if (hi - lo + 1 == n && pt != NV2A_PRIM_QUADS && pt != NV2A_PRIM_LINE_LOOP) {
+    if (hi - lo + 1 == n && !hle_draw_prim_converted(pt)) {
         bool seq = true;
         for (uint32_t i = 0; i < n && seq; i++) {
             seq = g_pd.idx[i] == lo + i;
@@ -3592,7 +3613,7 @@ static void draw_arrays(void)
         skip(SK_DRAW_ARRAYS_ARENA2);
         return;
     }
-    if (pt == NV2A_PRIM_QUADS || pt == NV2A_PRIM_LINE_LOOP) {
+    if (hle_draw_prim_converted(pt)) {
         for (uint32_t i = 0; i < n; i++) {
             g_pd.idx16[i] = (uint16_t)(g_pd.idx[i] - lo);
         }

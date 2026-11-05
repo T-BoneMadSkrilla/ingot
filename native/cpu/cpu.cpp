@@ -641,7 +641,12 @@ extern "C" void nc_cpu_fault_resume(NcCpu* cpu, void* ucontext) {
 // Darwin's si_code for these isn't BUS_ADRALN reliably: FEX's decoder decides.
 extern "C" bool nc_cpu_unaligned_fault(NcCpu* cpu, int code, void* ucontext) {
   auto* uc = static_cast<ucontext_t*>(ucontext);
-#ifndef __APPLE__
+#ifdef __APPLE__
+  // Darwin's si_code doesn't say: the data abort's status code does (DFSC 0x21, alignment).
+  if ((uc->uc_mcontext->__es.__esr & 0x3f) != 0x21) {
+    return false;
+  }
+#else
   if (code != BUS_ADRALN) {
     return false;
   }

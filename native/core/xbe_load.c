@@ -27,7 +27,15 @@
 
 bool nc_xbe_back(NcVm *vm, uint32_t va, uint32_t len)
 {
+#ifdef NC_VM16K
+    /* whole host pages, so a section's ends don't leave one part mapped
+     * (ex.c section_release keeps them whole) */
+    const uint32_t unit = nc_vm16k_plain() ? NC_PAGE : 16384u;
+    const uint64_t end = nc_align_up((uint64_t)va + len, unit);
+    va &= ~(unit - 1);
+#else
     const uint64_t end = nc_align_up((uint64_t)va + len, NC_PAGE);
+#endif
     for (uint64_t p = va & ~(NC_PAGE - 1); p < end;) {
         if (nc_vm_phys(vm, (uint32_t)p) != UINT32_MAX) {
             p += NC_PAGE;

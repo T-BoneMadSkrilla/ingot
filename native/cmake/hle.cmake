@@ -8,7 +8,15 @@ set(NC_DEPS "D:/tools/native-deps" CACHE PATH "native core third-party sources")
 
 add_library(nc_volk STATIC "${NC_DEPS}/volk/volk.c")
 target_include_directories(nc_volk PUBLIC "${NC_DEPS}/volk")
-target_compile_definitions(nc_volk PUBLIC VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR)
+if(APPLE)
+  target_compile_definitions(nc_volk PUBLIC VK_NO_PROTOTYPES VK_USE_PLATFORM_METAL_EXT)
+  set(NC_HLE_PLATFORM_LIBS "-framework QuartzCore" "-framework Metal" "-framework Foundation")
+  set(NC_APU_PLATFORM_LIBS "-framework AudioToolbox" "-framework CoreAudio")
+else()
+  target_compile_definitions(nc_volk PUBLIC VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR)
+  set(NC_HLE_PLATFORM_LIBS android log)
+  set(NC_APU_PLATFORM_LIBS aaudio log)
+endif()
 
 add_library(nc_spirv_reflect STATIC "${NC_DEPS}/spirv_reflect/spirv_reflect.c")
 target_include_directories(nc_spirv_reflect PUBLIC "${NC_DEPS}/spirv_reflect")
@@ -29,7 +37,11 @@ add_library(nc_glib STATIC "${CMAKE_CURRENT_SOURCE_DIR}/compat/glib/glib.c")
 target_include_directories(nc_glib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/compat/glib")
 set(NC_VSH "${NC_DEPS}/root/subprojects/nv2a_vsh_cpu/src")
 
-# Every HLE GPU source.
+# The GPU back end: vulkan (vk/, every platform) or metal (mtl/, Apple).
+set(HAKUX_GPU "vulkan" CACHE STRING "HLE GPU back end: vulkan or metal")
+set_property(CACHE HAKUX_GPU PROPERTY STRINGS vulkan metal)
+
+# Every HLE GPU source but the back end's.
 add_library(hakux_hle STATIC
   ${NC_HLE}/hle.c
   ${NC_HLE}/hitch.c
@@ -50,28 +62,13 @@ add_library(hakux_hle STATIC
   ${NC_HLE}/pb/pusher.c
   ${NC_HLE}/shader/ff_gen.c
   ${NC_HLE}/shader/ffhw.c
-  ${NC_HLE}/shader/glsl_compile.c
+  ${NC_HLE}/shader/msl.c
   ${NC_HLE}/shader/psh.c
   ${NC_HLE}/shader/vsh.c
   ${NC_HLE}/tex/xdk_res.c
   ${NC_HLE}/tex/xg_swizzle.c
   ${NC_HLE}/uma/uma.c
   ${NC_HLE}/util/thread.c
-  ${NC_HLE}/vk/back.c
-  ${NC_HLE}/vk/display.c
-  ${NC_HLE}/vk/swapchain.c
-  ${NC_HLE}/vk/batch.c
-  ${NC_HLE}/vk/compat.c
-  ${NC_HLE}/vk/draw.c
-  ${NC_HLE}/vk/quirks.c
-  ${NC_HLE}/vk/gamma.c
-  ${NC_HLE}/vk/guest_ram.c
-  ${NC_HLE}/vk/pcache.c
-  ${NC_HLE}/vk/pipeasync.c
-  ${NC_HLE}/vk/surf.c
-  ${NC_HLE}/vk/timeline.c
-  ${NC_HLE}/vk/vkdev.c
-  ${NC_HLE}/vk/zread.c
   ${NC_VSH}/nv2a_vsh_disassembler.c
   ${NC_VSH}/nv2a_vsh_cpu.c
   ${NC_VSH}/nv2a_vsh_emulator.c
@@ -80,21 +77,56 @@ add_library(hakux_hle STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/hle/host_native.c
   ${CMAKE_CURRENT_SOURCE_DIR}/hle/dirty.c
 )
-target_include_directories(hakux_hle PUBLIC "${NC_REPO}" "${NC_DEPS}/root" "${NC_DEPS}/vma/include"
-                           "${NC_DEPS}/glslang")
+if(HAKUX_GPU STREQUAL "metal")
+  if(NOT APPLE)
+    message(FATAL_ERROR "HAKUX_GPU=metal builds on Apple platforms only")
+  endif()
+  file(GLOB NC_HLE_MTL_SRC "${NC_HLE}/mtl/*.m" "${NC_HLE}/mtl/*.c")
+  target_sources(hakux_hle PRIVATE ${NC_HLE_MTL_SRC})
+  set_source_files_properties(${NC_HLE_MTL_SRC} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_compile_definitions(hakux_hle PUBLIC CONFIG_METAL=1)
+else()
+  target_sources(hakux_hle PRIVATE
+    ${NC_HLE}/shader/glsl_compile.c
+    ${NC_HLE}/vk/back.c
+    ${NC_HLE}/vk/display.c
+    ${NC_HLE}/vk/swapchain.c
+    ${NC_HLE}/vk/batch.c
+    ${NC_HLE}/vk/compat.c
+    ${NC_HLE}/vk/draw.c
+    ${NC_HLE}/vk/gpu_vk.c
+    ${NC_HLE}/vk/quirks.c
+    ${NC_HLE}/vk/gamma.c
+    ${NC_HLE}/vk/guest_ram.c
+    ${NC_HLE}/vk/pcache.c
+    ${NC_HLE}/vk/pipeasync.c
+    ${NC_HLE}/vk/surf.c
+    ${NC_HLE}/vk/timeline.c
+    ${NC_HLE}/vk/vkdev.c
+    ${NC_HLE}/vk/zread.c)
+  target_include_directories(hakux_hle PUBLIC "${NC_DEPS}/vma/include" "${NC_DEPS}/glslang")
+  target_compile_definitions(hakux_hle PUBLIC CONFIG_VULKAN=1)
+  target_link_libraries(hakux_hle PUBLIC nc_volk nc_spirv_reflect glslang SPIRV
+                        glslang-default-resource-limits)
+endif()
+target_include_directories(hakux_hle PUBLIC "${NC_REPO}" "${NC_DEPS}/root")
 # xxhash (single header, FEX's copy): pb/pbdraw.c's span hashes
 target_include_directories(hakux_hle PRIVATE "${HAKUX_FEX_DIR}/External/xxhash")
-target_compile_definitions(hakux_hle PUBLIC CONFIG_VULKAN=1 HAKUX_HLE_GPU=1 HAKUX_NATIVE_CORE=1)
+target_compile_definitions(hakux_hle PUBLIC HAKUX_HLE_GPU=1 HAKUX_NATIVE_CORE=1)
 target_compile_options(hakux_hle PRIVATE -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare)
-target_link_libraries(hakux_hle PUBLIC nc_glib nc_volk nc_spirv_reflect glslang SPIRV
-                      glslang-default-resource-limits android log)
+target_link_libraries(hakux_hle PUBLIC nc_glib ${NC_HLE_PLATFORM_LIBS})
 
 # The MCPX APU: xemu's device (hw/xbox/mcpx/apu) ported onto the core's own
 # services (native/dev/apu/apu_base.h).
 set(NC_APU "${CMAKE_CURRENT_SOURCE_DIR}/dev/apu")
+if(APPLE)
+  set(NC_APU_OUT ${NC_APU}/out_mac.c)
+else()
+  set(NC_APU_OUT ${NC_APU}/out.c)
+endif()
 add_library(hakux_apu STATIC
   ${NC_APU}/apu.c
-  ${NC_APU}/out.c
+  ${NC_APU_OUT}
   ${NC_APU}/state.c
   ${NC_APU}/dsp/debug.c
   ${NC_APU}/dsp/dsp.c
@@ -107,4 +139,4 @@ add_library(hakux_apu STATIC
 target_include_directories(hakux_apu PRIVATE "${NC_REPO}")
 target_compile_options(hakux_apu PRIVATE -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare
                        -Wno-unused-variable)
-target_link_libraries(hakux_apu PUBLIC hakux_hle aaudio log)
+target_link_libraries(hakux_apu PUBLIC hakux_hle ${NC_APU_PLATFORM_LIBS})

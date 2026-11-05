@@ -11,6 +11,7 @@
 #include "hw/xbox/hle/vk/batch.h"
 #include "hw/xbox/hle/vk/compat.h"
 #include "hw/xbox/hle/vk/quirks.h"
+#include "hw/xbox/hle/pb/pbres.h"
 
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
@@ -236,15 +237,30 @@ int hle_vk_init(void)
     vkEnumerateInstanceExtensionProperties(NULL, &nie, NULL);
     g_autofree VkExtensionProperties *iext = g_new(VkExtensionProperties, nie ? nie : 1);
     vkEnumerateInstanceExtensionProperties(NULL, &nie, iext);
-    const char *iexts[2];
+    const char *iexts[4];
     uint32_t nix = 0;
+    VkInstanceCreateFlags iflags = 0;
+#ifdef __APPLE__
+    /* MoltenVK: a CAMetalLayer's surface, and a portability driver the
+     * loader lists only when asked to */
+    if (has_ext(iext, nie, VK_KHR_SURFACE_EXTENSION_NAME) && has_ext(iext, nie, VK_EXT_METAL_SURFACE_EXTENSION_NAME)) {
+        iexts[nix++] = VK_KHR_SURFACE_EXTENSION_NAME;
+        iexts[nix++] = VK_EXT_METAL_SURFACE_EXTENSION_NAME;
+    }
+    if (has_ext(iext, nie, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        iexts[nix++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+        iflags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+#else
     if (has_ext(iext, nie, VK_KHR_SURFACE_EXTENSION_NAME) &&
         has_ext(iext, nie, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
         iexts[nix++] = VK_KHR_SURFACE_EXTENSION_NAME;
         iexts[nix++] = VK_KHR_ANDROID_SURFACE_EXTENSION_NAME;
     }
+#endif
     VkInstanceCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .flags = iflags,
         .pApplicationInfo = &app,
         .enabledExtensionCount = nix, .ppEnabledExtensionNames = iexts,
     };
@@ -686,6 +702,10 @@ int hle_vk_init(void)
     }
     if (c->swapchain) {
         exts[nx++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    }
+    if (has_ext(ext, ne, "VK_KHR_portability_subset")) {
+        exts[nx++] = "VK_KHR_portability_subset";   /* MoltenVK: required when offered */
+        g_hle_no_fans = true;                       /* its triangleFans is false */
     }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {

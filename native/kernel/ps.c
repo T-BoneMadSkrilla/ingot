@@ -21,6 +21,7 @@
 #include "native/kernel/kernel.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -83,6 +84,23 @@ static void list_init(NcVm *vm, uint32_t head)
  * a stack it holds, what it has over kept as a slot of its own; the region
  * ends at the GPU's view of RAM, where an allocation fails instead of
  * mapping over it (titles start a thread per movie and load). */
+/* The pages a stack of size at base commits: on a 16 KiB-page host up to
+ * the host page its top is in, so that page (the hottest) is mapped straight
+ * through (native/core/vm16k.c); the slot's addresses above the top are
+ * otherwise unused. */
+static uint32_t stack_commit(uint32_t base, uint32_t size)
+{
+#ifdef NC_VM16K
+    if (nc_vm16k_plain() && getenv("NC_VM16K_PLAIN")[0] == 'a') { /* "all" */
+        return size;
+    }
+    return nc_align_up(base + size, 16384u) - base;
+#else
+    (void)base;
+    return size;
+#endif
+}
+
 bool nc_ps_stack_alloc(NcKernel *k, uint32_t size, uint32_t *base)
 {
     if (!k->next_stack_va) {
@@ -91,7 +109,7 @@ bool nc_ps_stack_alloc(NcKernel *k, uint32_t size, uint32_t *base)
     const uint32_t span = STACK_GUARD + nc_align_up(size, STACK_GUARD);
     for (unsigned i = 0; i < k->nstack_free; i++) {
         const uint32_t va = k->stack_free[i].va, have = k->stack_free[i].span;
-        if (have < span || !nc_vm_alloc_at(k->vm, va + STACK_GUARD, size, NULL)) {
+        if (have < span || !nc_vm_alloc_at(k->vm, va + STACK_GUARD, stack_commit(va + STACK_GUARD, size), NULL)) {
             continue;
         }
         k->stack_free[i] = k->stack_free[--k->nstack_free];
@@ -107,7 +125,7 @@ bool nc_ps_stack_alloc(NcKernel *k, uint32_t size, uint32_t *base)
         nc_log("hakuX-native", "ps: the stack region is full (%u KiB more asked)", size >> 10);
         return false;
     }
-    if (!nc_vm_alloc_at(k->vm, slot + STACK_GUARD, size, NULL)) {
+    if (!nc_vm_alloc_at(k->vm, slot + STACK_GUARD, stack_commit(slot + STACK_GUARD, size), NULL)) {
         return false;
     }
     k->next_stack_va = slot + span;
@@ -117,6 +135,14 @@ bool nc_ps_stack_alloc(NcKernel *k, uint32_t size, uint32_t *base)
 
 void nc_ps_stack_free(NcKernel *k, uint32_t base, uint32_t size)
 {
+    /* the pages over its top stack_commit added (the caller frees the stack's own) */
+    for (uint32_t p = base + size; p < base + stack_commit(base, size); p += NC_PAGE) {
+        const uint32_t pa = nc_vm_phys(k->vm, p);
+        if (pa != UINT32_MAX) {
+            nc_vm_unmap(k->vm, p, NC_PAGE);
+            nc_vm_free_phys(k->vm, pa & ~(NC_PAGE - 1), NC_PAGE);
+        }
+    }
     const uint32_t slot = base - STACK_GUARD, span = STACK_GUARD + nc_align_up(size, STACK_GUARD);
     if (base < STACK_REGION + STACK_GUARD || base % STACK_GUARD || !size || span > k->next_stack_va - slot ||
         k->nstack_free == sizeof(k->stack_free) / sizeof(k->stack_free[0])) {

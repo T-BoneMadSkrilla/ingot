@@ -18,7 +18,9 @@
  *                    pipeline caches written first
  *   hang=S           no new frame for S seconds: the guest's state reported
  *                    and exit 6 (from the start: a load's first frame too)
- * NC_TIMEOUT=S (default 30, 0 none) ends any run after S seconds.
+ *   window=0         macOS: no window (mac/window.m; there by default, with
+ *                    the keyboard and a game controller as player 1)
+ * NC_TIMEOUT=S (default 30, 0 none; with a window, none) ends any run after S seconds.
  *
  * Exit status: 0 the run ended (frames=, or the guest halted), 1 boot
  * failed, 2 usage or the disc can't be opened, 3 a host fault, 5 NC_TIMEOUT,
@@ -42,8 +44,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <ucontext.h>
+#include "native/core/hostctx.h"
 #include <unistd.h>
+#ifdef __APPLE__
+#include "mac/window.h"
+#endif
 
 static NcCore g_core;
 
@@ -52,6 +57,9 @@ static NcCore g_core;
 void nc_capture_start(void);
 void nc_capture_frames(const char *list, uint64_t stop);
 static void dump_ranges(const char *spec);
+#ifdef NC_VM16K
+static void vm16k_report(const char *when);
+#endif
 
 /* Hex dump of mapped guest bytes (unmapped pages show as ..). */
 static void dump_guest(const NcVm *vm, const char *what, uint32_t va, unsigned len)
@@ -72,7 +80,7 @@ static void dump_guest(const NcVm *vm, const char *what, uint32_t va, unsigned l
 /* Guest state at a signal: registers live in host registers inside JIT code
  * (FEX's 32-bit static mapping: eax x4, ecx x7, edx x5, ebx x6, esp x8, ebp x9,
  * esi x10, edi x11). */
-static void report_guest(const mcontext_t *mc, uint32_t eip)
+static void report_guest(const NcHostRegs *mc, uint32_t eip)
 {
     if (eip) {
         static const char *const names[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
@@ -135,7 +143,7 @@ static void fault(int sig, siginfo_t *info, void *ctx)
     if (nc_core_fault(&g_core, sig, info, ctx)) {
         return;
     }
-    const mcontext_t *mc = &((ucontext_t *)ctx)->uc_mcontext;
+    const NcHostRegs *mc = nc_host_regs(ctx);
     uint64_t guest = nc_vm_guest_of(&g_core.vm, info->si_addr);
     uint32_t eip = nc_cpu_guest_eip_at(g_core.cpu, (uintptr_t)mc->pc);
     char buf[256];
@@ -192,12 +200,15 @@ static unsigned g_timeout;
 
 static void timeout(int sig, siginfo_t *info, void *ctx)
 {
-    const mcontext_t *mc = &((ucontext_t *)ctx)->uc_mcontext;
+    const NcHostRegs *mc = nc_host_regs(ctx);
     uint32_t eip = nc_cpu_guest_eip_at(g_core.cpu, (uintptr_t)mc->pc);
     char buf[160];
     int n = snprintf(buf, sizeof(buf), "hakuX-native-frontier: timeout after %u s: host_pc=%llx guest_eip=%08x%s\n",
                      g_timeout, (unsigned long long)mc->pc, eip, eip ? "" : " (not in guest code)");
     write(2, buf, (size_t)n);
+#ifdef NC_VM16K
+    vm16k_report("timeout");
+#endif
     report_guest(mc, eip);
     dump_ranges(getenv("NC_FAULT_DUMP"));
     _exit(5);
@@ -235,6 +246,28 @@ static void dump_ranges(const char *spec)
     }
 }
 
+#ifdef NC_VM16K
+/* The 16 KiB host pages over the guest space: mapped straight through,
+ * trapped (their accesses emulated), and the emulated accesses' rate. */
+static void vm16k_report(const char *when)
+{
+    uint32_t direct, trapped;
+    uint64_t emulated;
+    nc_vm16k_census(&g_core.vm, &direct, &trapped, &emulated);
+    static uint64_t last_emulated, last_ms;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    const double rate = last_ms && now > last_ms ? (double)(emulated - last_emulated) * 1000.0 / (double)(now - last_ms) : 0;
+    nc_log("hakuX-native-vm16k", "%s: %u direct, %u trapped host pages (%.1f%% trapped); %llu accesses emulated, %.0f/s",
+           when, direct, trapped, direct + trapped ? 100.0 * trapped / (direct + trapped) : 0.0,
+           (unsigned long long)emulated, rate);
+    last_emulated = emulated;
+    last_ms = now;
+    nc_vm16k_dump(&g_core.vm);
+}
+#endif
+
 /* hang=: the watchdog over the frames (and a lost GPU, which stops them for
  * good: the run would only reach NC_TIMEOUT). */
 static unsigned g_hang_s;
@@ -249,13 +282,37 @@ static uint64_t mono_ms(void)
 static void *watchdog(void *arg)
 {
     uint64_t frames = hle_back_swap_count(), since = mono_ms();
+#ifdef NC_VM16K
+    unsigned ticks = 0;
+#endif
     for (;;) {
         usleep(100 * 1000);
+#ifdef NC_VM16K
+        if (++ticks % 50 == 0) {
+            char when[64];
+            snprintf(when, sizeof(when), "%us, frame %llu", ticks / 10, (unsigned long long)hle_back_swap_count());
+            vm16k_report(when);
+        }
+#endif
         if (nc_hle_fatal_kind() == NC_FATAL_GPU_LOST) {
             nc_log("hakuX-native-frontier", "GPU lost: %s", nc_hle_fatal() ? nc_hle_fatal() : "?");
             _exit(9);
         }
         const uint64_t n = hle_back_swap_count(), now = mono_ms();
+#ifdef __APPLE__
+        /* SIGALRM can land on a thread that has it blocked here: the
+         * watchdog ends the run instead */
+        static uint64_t start;
+        if (!start) {
+            start = now;
+        }
+        if (g_timeout && now - start >= g_timeout * 1000ull) {
+            nc_log("hakuX-native-frontier", "timeout after %u s (frame %llu)", g_timeout, (unsigned long long)n);
+            vm16k_report("timeout");
+            report_guest(NULL, 0);
+            _exit(5);
+        }
+#endif
         if (n != frames) {
             frames = n;
             since = now;
@@ -267,6 +324,14 @@ static void *watchdog(void *arg)
         }
     }
     return NULL;
+}
+
+static int run_core(void *arg)
+{
+    (void)arg;
+    nc_core_run(&g_core);
+    const NcKernel *k = &g_core.kernel;
+    return k->quit || k->relaunch ? 10 : k->stop ? 7 : 0;
 }
 
 int main(int argc, char **argv)
@@ -311,6 +376,10 @@ int main(int argc, char **argv)
     }
     const char *capture = NULL;
     uint64_t stop = 0;
+    bool window = false;
+#ifdef __APPLE__
+    window = true;
+#endif
     for (int i = 2; i < argc; i++) {
         if (nc_option(&opt, argv[i])) {
             continue;
@@ -325,6 +394,8 @@ int main(int argc, char **argv)
             stop = strtoull(argv[i] + 7, NULL, 10);
         } else if (!strncmp(argv[i], "hang=", 5)) {
             g_hang_s = (unsigned)atoi(argv[i] + 5);
+        } else if (!strncmp(argv[i], "window=", 7)) {
+            window = atoi(argv[i] + 7) != 0;
         } else {
             fprintf(stderr, "xboxrun: unknown option %s\n", argv[i]);
             return 2;
@@ -332,6 +403,19 @@ int main(int argc, char **argv)
     }
     nc_options_apply(&opt);
     nc_log("hakuX-native", "xboxrun: disc %s, hdd %s", argv[1], nc_io_hdd_root());
+#ifdef __APPLE__
+    /* the HLE GPU's shader and pipeline caches beside the hard disk, as the
+     * app keeps them (native/app/app_main.c): the default is Android's */
+    if (!getenv("HAKUX_NATIVE_BASE")) {
+        char base[512];
+        snprintf(base, sizeof(base), "%s/../hle", nc_io_hdd_root());
+        setenv("HAKUX_NATIVE_BASE", base, 1);
+    }
+#endif
+    if (window) {
+        g_timeout = getenv("NC_TIMEOUT") ? g_timeout : 0;
+        nc_present_init();
+    }
 
     if (!nc_core_boot(&g_core, fd)) {
         nc_log("hakuX-native-frontier", "boot failed%s%s", nc_hle_fatal() ? ": " : "",
@@ -347,8 +431,15 @@ int main(int argc, char **argv)
     pthread_t wd;
     pthread_create(&wd, NULL, watchdog, NULL);
     pthread_detach(wd);
+#ifdef NC_VM16K
+    vm16k_report("boot");
+#endif
     alarm(g_timeout);
-    nc_core_run(&g_core);
-    const NcKernel *k = &g_core.kernel;
-    return k->quit || k->relaunch ? 10 : k->stop ? 7 : 0;
+#ifdef __APPLE__
+    if (window) {
+        const char *name = strrchr(argv[1], '/');
+        nc_mac_window_run(name ? name + 1 : argv[1], run_core, NULL);
+    }
+#endif
+    return run_core(NULL);
 }

@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -102,7 +103,15 @@ static bool kai_init(void)
         nc_log("hakuX-native-net", "kai: no engine address (kai=HOST)");
         return false;
     }
+    #ifdef __APPLE__
+    g_kai.fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_kai.fd >= 0) {
+        fcntl(g_kai.fd, F_SETFL, fcntl(g_kai.fd, F_GETFL) | O_NONBLOCK);
+        fcntl(g_kai.fd, F_SETFD, FD_CLOEXEC);
+    }
+    #else
     g_kai.fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    #endif
     if (g_kai.fd < 0) {
         nc_log("hakuX-native-net", "kai: socket: %s", strerror(errno));
         return false;

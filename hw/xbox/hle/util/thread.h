@@ -6,7 +6,11 @@
 #define HW_XBOX_HLE_UTIL_THREAD_H
 
 #include <pthread.h>
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#else
 #include <semaphore.h>
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
@@ -20,7 +24,11 @@ typedef struct HleCond {
 } HleCond;
 
 typedef struct HleSem {
+#ifdef __APPLE__
+    dispatch_semaphore_t s; /* Darwin has no unnamed POSIX semaphores */
+#else
     sem_t s;
+#endif
 } HleSem;
 
 /* Set / reset by hand; waiters wait for "set". */

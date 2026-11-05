@@ -209,7 +209,7 @@ static bool commit(NcKernel *k, uint32_t va, uint32_t size, bool zero)
         }
         /* Largest contiguous physical piece we can get for this run. */
         uint32_t piece = run, pa = UINT32_MAX;
-        while (piece >= NC_PAGE && (pa = nc_vm_alloc_phys(k->vm, piece, 0, k->vm->ram_size)) == UINT32_MAX) {
+        while (piece >= NC_PAGE && (pa = nc_vm_alloc_phys_va(k->vm, p, piece, 0, k->vm->ram_size)) == UINT32_MAX) {
             piece = piece > NC_PAGE ? nc_align_up(piece / 2, NC_PAGE) : 0;
         }
         if (pa == UINT32_MAX || !nc_vm_map(k->vm, p, pa, piece)) {
@@ -568,8 +568,8 @@ static uint32_t contig_alloc(NcKernel *k, uint32_t size, uint32_t lo, uint32_t h
         if (n <= 4 || !(n & (n - 1))) {
             char runs[400];
             nc_vm_free_runs(k->vm, runs, sizeof(runs));
-            nc_log("hakuX-native", "mm: contiguous allocation of %u KiB failed (#%u; free %u KiB:%s)", size >> 10, n,
-                   nc_vm_free_bytes(k->vm) >> 10, runs);
+            nc_log("hakuX-native", "mm: contiguous allocation of %u KiB in [%08x, %08x) align %x by %08x failed "
+                   "(#%u; free %u KiB:%s)", size >> 10, lo, hi, align, ra, n, nc_vm_free_bytes(k->vm) >> 10, runs);
             log_splitters(k);
             log_phys_map(k);
             log_holders(k, "contiguous allocation failed");

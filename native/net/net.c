@@ -10,7 +10,11 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <fcntl.h>
+#else
 #include <sys/eventfd.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -38,6 +42,7 @@ static struct {
     pthread_cond_t rx_cond;
     Ring tx, rx;
     int wake_fd;                        /* eventfd: frames to send */
+    int wake_wr;                        /* macOS: the wake pipe's write end */
     uint8_t mac[6];                     /* the NIC's station address, 0: none yet */
     uint64_t sent, received;
     char pcap_path[128];                /* pcap=: "" none */
@@ -216,7 +221,11 @@ void nc_net_send(const uint8_t *frame, size_t len)
     pthread_mutex_unlock(&g_net.lock);
     if (ok) {
         const uint64_t one = 1;
+#ifdef __APPLE__
+        (void)!write(g_net.wake_wr, &one, sizeof(one));
+#else
         (void)!write(g_net.wake_fd, &one, sizeof(one));
+#endif
     }
 }
 
@@ -379,7 +388,19 @@ void nc_net_start(void)
         nc_log("hakuX-native-net", "network off: the NIC has no link");
         return;
     }
+#ifdef __APPLE__
+    int wake[2];
+    if (pipe(wake) == 0) {
+        for (int i = 0; i < 2; i++) {
+            fcntl(wake[i], F_SETFL, O_NONBLOCK);
+            fcntl(wake[i], F_SETFD, FD_CLOEXEC);
+        }
+        g_net.wake_fd = wake[0];
+        g_net.wake_wr = wake[1];
+    }
+#else
     g_net.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#endif
     if (g_net.wake_fd < 0 || !ring_init(&g_net.tx, TX_SLOTS) || !ring_init(&g_net.rx, RX_SLOTS) || !be->init()) {
         nc_log("hakuX-native-net", "%s: couldn't start: the NIC has no link", be->name);
         return;

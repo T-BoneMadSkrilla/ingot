@@ -1,43 +1,53 @@
-# hakuX
+# Ingot
 
-hakuX runs original Xbox games on Android (arm64), tuned for Adreno GPUs.
+Ingot runs original Xbox games on Macs with Apple silicon, drawn with Metal.
 
-Its core runs the game's x86 code on a JIT (a FEX fork) under a
-reimplementation of the Xbox kernel, and draws by decoding the push buffer
-the game's own Direct3D sends the NV2A into Vulkan. Audio is the MCPX APU,
-ported from xemu.
+It's a fork of [hakuX](https://github.com/rfandango/hakuX), the Android Xbox
+emulator: the game's x86 code runs on hakuX's JIT (a FEX fork) under its
+reimplementation of the Xbox kernel, and the game's Direct3D push buffer is
+decoded into Metal instead of Vulkan. Audio is the MCPX APU, ported from xemu.
+What's Mac-specific:
 
-## hakuX is free
+- a Metal renderer (`hw/xbox/hle/mtl/`) behind the HLE GPU's seam;
+- guest memory laid out for 16 KiB host pages (`native/core/vm16k.c` and the
+  regrouping in `native/core/vm.c`), so the Xbox's 4 KiB pages map straight
+  through instead of trapping;
+- Core Audio output and a Cocoa game window (`mac/window.m`);
+- the Ingot app, a SwiftUI game library (`mac/ingot/`).
 
-hakuX is free, and always will be. The only official download is
-[hakuX's GitHub releases](https://github.com/rfandango/hakuX/releases).
-
-If you paid for hakuX in any way, shape or form, you were scammed. That
-includes a store purchase, a subscription, an in-app unlock, a "premium"
-build, or an app that repackages it. Ask for a refund wherever you paid, and
-get hakuX here for free.
+Ingot is not hakuX, and hakuX's author doesn't support it: report Ingot
+problems here, not upstream.
 
 ## Requirements
 
-- An arm64 Android device with Vulkan. Custom Turnip drivers can be loaded
-  for Adreno GPUs.
+- A Mac with Apple silicon, macOS 14 or later.
 - Your own game images (ISO or XISO), dumped from discs you own.
 
-No BIOS, MCPX ROM or hard disk image is needed. hakuX doesn't include any
+No BIOS, MCPX ROM or hard disk image is needed. Ingot doesn't include any
 copyrighted Xbox software.
 
 ## Building
 
-See [android/README.md](android/README.md).
+With CMake, Ninja and the Xcode command line tools:
+
+    mac/ingot/build.sh
+
+builds the Metal core and `../build/Ingot.app`. Put your disc images in
+`~/Documents/xbox` (or add a folder in Settings) and double-click a game.
+
+For the bare core, `ninja -C ../build/mac-metal xboxrun` and run
+`xboxrun <disc image> hdd=<folder>`.
 
 ## License
 
-hakuX is free software under the GNU General Public License, version 3 or
-later ([COPYING](COPYING)): anyone who distributes it, or a work based on it,
-must make the complete source available under the same license. The code
-ported from xemu (the MCPX APU) and the third-party components keep their
-own licenses, listed in [LICENSE](LICENSE) and [licenses/](licenses/).
+Ingot, like hakuX, is free software under the GNU General Public License,
+version 3 or later ([COPYING](COPYING)): anyone who distributes it, or a work
+based on it, must make the complete source available under the same license.
+The code ported from xemu and the third-party components keep their own
+licenses, listed in [LICENSE](LICENSE) and [licenses/](licenses/). hakuX's
+own README is kept as [README.hakuX.md](README.hakuX.md).
 
 ## Notes
 
-- hakuX is not affiliated with Microsoft.
+- Ingot is not affiliated with Microsoft or with hakuX.
+- "Xbox" is a trademark of Microsoft, used here only to say what Ingot runs.

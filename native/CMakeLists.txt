@@ -14,7 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # off, fex.cmake): the decoder and the renderer ~2% lighter (the RP5, DOA2).
 # The cache keeps relinking after a change to the files changed.
 option(HAKUX_LTO "ThinLTO in Release builds (FEX excepted)" ON)
-if(HAKUX_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
+if(HAKUX_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT APPLE)
   include(CheckIPOSupported)
   check_ipo_supported(RESULT nc_ipo LANGUAGES C CXX)
   if(nc_ipo)
@@ -24,6 +24,11 @@ if(HAKUX_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 get_filename_component(NC_REPO "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+if(ANDROID)
+  set(NC_LOG_LIB log)
+else()
+  set(NC_LOG_LIB "")
+endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/fex.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/hle.cmake")
 
@@ -52,11 +57,15 @@ target_include_directories(nc_slirp BEFORE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/
 target_include_directories(nc_slirp PUBLIC "${CMAKE_BINARY_DIR}/slirp")
 target_link_libraries(nc_slirp PRIVATE nc_glib)
 target_compile_options(nc_slirp PRIVATE -w)
+if(APPLE)
+  target_link_libraries(nc_slirp PUBLIC resolv)  # the host's DNS servers (res_ninit)
+endif()
 
 add_library(hakux_native STATIC
   core/log.c
   core/jmp.c
   core/vm.c
+  core/vm16k.c
   core/xdvdfs.c
   core/xbe_load.c
   core/mods.c
@@ -109,16 +118,22 @@ target_include_directories(hakux_native PUBLIC "${NC_REPO}")
 target_include_directories(hakux_native PRIVATE "${HAKUX_FEX_DIR}/External/xxhash")
 # The HLE layer's pure modules build without QEMU in this mode.
 target_compile_definitions(hakux_native PRIVATE HLE_HOST_TEST)
-target_link_libraries(hakux_native PUBLIC nc_fex hakux_hle hakux_apu nc_slirp log z)
+target_link_libraries(hakux_native PUBLIC nc_fex hakux_hle hakux_apu nc_slirp ${NC_LOG_LIB} z)
 target_compile_options(hakux_native PRIVATE -Wall -Wno-unused-parameter)
 
 # xboxrun's custom Vulkan driver ("vkdriver="): the app's code for it
 # (native/app/vkdriver.c, vklayer.c), through adrenotools when NC_DEPS has it
 # (cmake/app.cmake).
 add_executable(xboxrun run/xboxrun.c run/capture.c app/vkdriver.c app/vklayer.c)
-target_link_libraries(xboxrun PRIVATE hakux_native hakux_hle z log)
+target_link_libraries(xboxrun PRIVATE hakux_native hakux_hle z ${NC_LOG_LIB})
+if(HAKUX_GPU STREQUAL "metal")
+  # no Vulkan SDK: the headers FEX ships (the loader is found at run time)
+  target_include_directories(xboxrun PRIVATE "${HAKUX_FEX_DIR}/External/Vulkan-Headers/include")
+endif()
 target_link_libraries(hakux_hle PUBLIC hakux_native)
 target_link_libraries(nc_slirp PRIVATE hakux_native)   # nc_log
 
 # The hakuX app's native core library (native/app, cmake/app.cmake).
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/app.cmake")
+if(ANDROID)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/app.cmake")
+endif()

@@ -284,6 +284,28 @@ static inline const char *hle_push_glsl(void)
 #define HLE_ZNORM_GLSL(z, out) \
     "  precise float " out " = " z " * pc.zscale + " z " * (pc.zscale == uintBitsToFloat(0x33800000u) ||\n" \
     "      pc.zscale == uintBitsToFloat(0x37800000u) ? pc.zscale * pc.zscale : 0.0);\n"
+
+/* Reversed depth (g_hle_glsl_revz, the Metal back end): stored depth is
+ * 1 - z / max, so the far end, where perspective depth gathers, lands near
+ * 0.0 with float precision to spare. Stored forward, a D24 step near the far
+ * plane is one float ulp, and the w round trip and interpolation lose it:
+ * NCAA Football 06 draws its grass a step in front of its coplanar detail
+ * layer (LESS), and fought it in grey patches. The distance to the far end
+ * is taken before scaling (zmax - z is exact there), less the polygon
+ * offset's constant part in depth units (psc[18]: a float depth buffer's
+ * hardware bias unit shrinks with the stored value, and would vanish). */
+extern bool g_hle_glsl_revz;
+#define HLE_ZNORM_REV_GLSL(z, out) \
+    "  float zMax = pc.zscale == uintBitsToFloat(0x33800000u) ? 16777215.0 :\n" \
+    "      pc.zscale == uintBitsToFloat(0x37800000u) ? 65535.0 : 1.0 / pc.zscale;\n" \
+    "  precise float zR = zMax - " z ";\n" \
+    "  zR -= uintBitsToFloat(pc.psc[18]);\n" \
+    "  precise float " out " = zR * pc.zscale + zR * (pc.zscale == uintBitsToFloat(0x33800000u) ||\n" \
+    "      pc.zscale == uintBitsToFloat(0x37800000u) ? pc.zscale * pc.zscale : 0.0);\n"
+/* fixed function, from a clip-space z in [0, w] */
+#define HLE_ZREV_CLIP_GLSL \
+    "  gl_Position.z = gl_Position.w - gl_Position.z -\n" \
+    "      uintBitsToFloat(pc.psc[18]) * pc.zscale * gl_Position.w;\n"
 /* first in main (derivatives before any discard), stored last */
 #define HLE_WBUF_CALC_GLSL \
     "  float wRaw = vW + uintBitsToFloat(pc.psc[18]) + uintBitsToFloat(pc.psc[19]) *\n" \
@@ -291,6 +313,11 @@ static inline const char *hle_push_glsl(void)
     HLE_ZNORM_GLSL("wRaw", "wN") \
     "  float wDepth = clamp(wN, 0.0, 1.0);\n"
 #define HLE_WBUF_STORE_GLSL "  gl_FragDepth = wDepth;\n"
+#define HLE_WBUF_STORE_REV_GLSL "  gl_FragDepth = 1.0 - wDepth;\n"
+static inline const char *hle_wbuf_store_glsl(void)
+{
+    return g_hle_glsl_revz ? HLE_WBUF_STORE_REV_GLSL : HLE_WBUF_STORE_GLSL;
+}
 
 /* EQUAL depth passes that do not write (vk/draw.c eq_tol) test LESSEQUAL a
  * step toward the eye, which passes everything in front of the stored depth

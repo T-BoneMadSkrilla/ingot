@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "hw/xbox/hle/shader/ff.h"
+#include "hw/xbox/hle/shader/msl.h"
 
 typedef struct Buf {
     char *p;
@@ -35,9 +36,27 @@ static void put(Buf *b, const char *fmt, ...)
     b->len += (size_t)n;
 }
 
+static void io(Buf *b, HleMsl *m, bool in, unsigned loc, bool flat, const char *type,
+               const char *name)
+{
+    char line[96];
+    hle_msl_io(m, line, sizeof(line), in, loc, flat, type, name);
+    put(b, "%s", line);
+}
+
+static void msl_end(Buf *b, const HleMsl *m)
+{
+    if (m && !b->overflow) {
+        size_t n = hle_msl_entry(m, b->p + b->len, b->cap - b->len);
+        b->overflow |= !n;
+        b->len += n;
+    }
+}
+
 bool g_hle_push_ssbo;                   /* ff.h */
 bool g_hle_glsl_zw;                     /* ff.h */
 bool g_hle_glsl_zclamp;                 /* ff.h */
+bool g_hle_glsl_revz;                   /* ff.h */
 bool g_hle_glsl_fixed;                  /* ff.h */
 
 size_t hle_glsl_fixed_slots(char *src, size_t cap)
@@ -97,43 +116,53 @@ size_t hle_ff_vs_glsl(const HleFfVsKey *k, char *buf, size_t cap)
     Buf b = { buf, cap, 0, false };
     uint32_t pos = k->fvf & HLE_FVF_POSITION_MASK;
     unsigned ntc = (k->fvf & HLE_FVF_TEXCOUNT_MASK) >> HLE_FVF_TEXCOUNT_SHIFT;
-    const char *interp = k->flat ? "flat " : "";
     /* pre-transformed vertices read the block only for the point size */
     bool ubo = hle_ff_vs_needs_ubo(k) && (pos != HLE_FVF_XYZRHW || k->points);
     bool xf = ubo && pos != HLE_FVF_XYZRHW;
     bool normal = (k->fvf & HLE_FVF_NORMAL) != 0;
-    put(&b, "#version 450\n%s", hle_push_glsl());
-    if (ubo) {
+    HleMsl msl = { .fs = false }, *m = g_hle_msl ? &msl : NULL;
+    char name[16];
+    if (m) {
+        put(&b, "%s", hle_msl_begin(false));
+    } else {
+        put(&b, "#version 450\n%s", hle_push_glsl());
+    }
+    if (ubo && m) {
+        put(&b, "%s", hle_msl_ubo(m, 2));
+    } else if (ubo) {
         put(&b, "layout(set = 1, binding = 0, std140) uniform FfConst { vec4 f[%u]; };\n",
             HLE_FFU_COUNT);
     }
-    put(&b, "layout(location = 0) in vec4 iPos;\n");
+    io(&b, m, true, 0, false, "vec4", "iPos");
     if (normal) {
-        put(&b, "layout(location = 1) in %s;\n", k->cmp_normal ? "uvec2 iNormalP" : "vec3 iNormal");
+        io(&b, m, true, 1, false, k->cmp_normal ? "uvec2" : "vec3",
+           k->cmp_normal ? "iNormalP" : "iNormal");
     }
     if (k->fvf & HLE_FVF_DIFFUSE) {
-        put(&b, "layout(location = 2) in vec4 iDiffuse;\n");
+        io(&b, m, true, 2, false, "vec4", "iDiffuse");
     }
     if (k->fvf & HLE_FVF_SPECULAR) {
-        put(&b, "layout(location = 3) in vec4 iSpecular;\n");
+        io(&b, m, true, 3, false, "vec4", "iSpecular");
     }
     for (unsigned i = 0; i < ntc && i < HLE_FF_STAGES; i++) {
-        put(&b, "layout(location = %u) in vec4 iTex%u;\n", 4 + i, i);
+        snprintf(name, sizeof(name), "iTex%u", i);
+        io(&b, m, true, 4 + i, false, "vec4", name);
     }
     if (xf && k->blend) {
-        put(&b, "layout(location = 8) in vec4 iWeight;\n");
+        io(&b, m, true, 8, false, "vec4", "iWeight");
     }
     if (k->points && (k->fvf & HLE_FVF_PSIZE)) {
-        put(&b, "layout(location = 9) in float iPSize;\n");
+        io(&b, m, true, 9, false, "float", "iPSize");
     }
-    put(&b, "layout(location = 0) %sout vec4 vDiffuse;\n", interp);
-    put(&b, "layout(location = 1) %sout vec4 vSpecular;\n", interp);
+    io(&b, m, false, 0, k->flat, "vec4", "vDiffuse");
+    io(&b, m, false, 1, k->flat, "vec4", "vSpecular");
     for (unsigned s = 0; s < k->ntex && s < HLE_FF_STAGES; s++) {
-        put(&b, "layout(location = %u) out vec4 vTex%u;\n", 2 + s, s);
+        snprintf(name, sizeof(name), "vTex%u", s);
+        io(&b, m, false, 2 + s, false, "vec4", name);
     }
-    put(&b, "layout(location = 6) out float vFog;\n");
+    io(&b, m, false, 6, false, "float", "vFog");
     if (k->wbuf) {      /* W-buffering: the clip w for the pixel stage's depth */
-        put(&b, "layout(location = 9) out float vW;\n");
+        io(&b, m, false, 9, false, "float", "vW");
     }
     if (xf) {
         put(&b, "mat4 m4(int i) { return mat4(f[i], f[i + 1], f[i + 2], f[i + 3]); }\n");
@@ -157,6 +186,9 @@ size_t hle_ff_vs_glsl(const HleFfVsKey *k, char *buf, size_t cap)
                 "  vec2 ndc = scr * pc.vp + vec2(-1.0, 1.0);\n"
                 "  gl_Position = vec4(ndc * w, iPos.z * w, w);\n"
                 "  vec3 ePos = vec3(0.0), eN = vec3(0.0, 0.0, -1.0);\n");
+        if (g_hle_glsl_revz) {
+            put(&b, "  gl_Position.z = (1.0 - iPos.z - uintBitsToFloat(pc.psc[18]) * pc.zscale) * w;\n");
+        }
     } else if (!xf) {
         put(&b, "  gl_Position = pc.mvp * vec4(iPos.xyz, 1.0);\n"
                 "  vec3 ePos = vec3(0.0, 0.0, gl_Position.w), eN = vec3(0.0, 0.0, -1.0);\n");
@@ -324,6 +356,9 @@ size_t hle_ff_vs_glsl(const HleFfVsKey *k, char *buf, size_t cap)
                 HLE_TEXEL_EDGE_GLSL("q")
                 "      s = q * c.w; }\n"
                 "    gl_Position = vec4(s * pc.vp + vec2(-1.0, 1.0) * c.w, c.z, c.w); }\n");
+        if (g_hle_glsl_revz) {
+            put(&b, HLE_ZREV_CLIP_GLSL);
+        }
     }
     if (k->zclamp && g_hle_glsl_zclamp) {
         put(&b, HLE_ZCLAMP_GLSL);
@@ -332,6 +367,7 @@ size_t hle_ff_vs_glsl(const HleFfVsKey *k, char *buf, size_t cap)
         put(&b, HLE_ZW_NUDGE_GLSL);
     }
     put(&b, "%s}\n", k->wbuf ? "  vW = gl_Position.w;\n" : "");
+    msl_end(&b, m);
     return b.overflow ? 0 : b.len;
 }
 
@@ -490,30 +526,44 @@ static const char *k_cmp[8] = {
 size_t hle_ff_ps_glsl(const HleFfPsKey *k, char *buf, size_t cap)
 {
     Buf b = { buf, cap, 0, false };
-    const char *interp = k->flat ? "flat " : "";
-    put(&b, "#version 450\n#extension GL_EXT_nonuniform_qualifier : require\n%s", hle_push_glsl());
-    put(&b, "layout(set = 0, binding = 0) uniform texture2D uTex2D[];\n"
-            "layout(set = 0, binding = 1) uniform sampler uSmp[];\n");
-    put(&b, "layout(location = 0) %sin vec4 vDiffuse;\n", interp);
-    put(&b, "layout(location = 1) %sin vec4 vSpecular;\n", interp);
+    HleMsl msl = { .fs = true }, *m = g_hle_msl ? &msl : NULL;
+    char name[16];
+    if (m) {
+        put(&b, "%s%s", hle_msl_begin(true), hle_msl_tex(m, 1));
+    } else {
+        put(&b, "#version 450\n#extension GL_EXT_nonuniform_qualifier : require\n%s",
+            hle_push_glsl());
+        put(&b, "layout(set = 0, binding = 0) uniform texture2D uTex2D[];\n"
+                "layout(set = 0, binding = 1) uniform sampler uSmp[];\n");
+    }
+    io(&b, m, true, 0, k->flat, "vec4", "vDiffuse");
+    io(&b, m, true, 1, k->flat, "vec4", "vSpecular");
     for (unsigned s = 0; s < k->nstages; s++) {
         if (k->st[s].texture) {
-            put(&b, "layout(location = %u) in vec4 vTex%u;\n", 2 + s, s);
+            snprintf(name, sizeof(name), "vTex%u", s);
+            io(&b, m, true, 2 + s, false, "vec4", name);
         }
     }
     if (k->fog) {
-        put(&b, "layout(location = 6) in float vFog;\n");
+        io(&b, m, true, 6, false, "float", "vFog");
     }
     if (k->wbuf) {
-        put(&b, HLE_WBUF_IN_GLSL);
+        io(&b, m, true, 9, false, "float", "vW");
     }
-    put(&b, "layout(location = 0) out vec4 oColor;\n" HLE_NVPROJ_GLSL);
-    if (k->sblend || (k->fbfetch & ~HLE_FB_ZEQ)) {
-        put(&b, "layout(input_attachment_index = 0, set = 2, binding = 0) "
-                "uniform subpassInput uFb;\n");
-    }
-    if (k->fbfetch & HLE_FB_ZEQ) {
-        put(&b, HLE_ZEQ_DECL_GLSL);
+    io(&b, m, false, 0, false, "vec4", "oColor");
+    put(&b, HLE_NVPROJ_GLSL);
+    if (m) {
+        m->fb = k->sblend || (k->fbfetch & ~HLE_FB_ZEQ);
+        m->ptc = k->point_sprite;
+        m->depth = k->wbuf;
+    } else {
+        if (k->sblend || (k->fbfetch & ~HLE_FB_ZEQ)) {
+            put(&b, "layout(input_attachment_index = 0, set = 2, binding = 0) "
+                    "uniform subpassInput uFb;\n");
+        }
+        if (k->fbfetch & HLE_FB_ZEQ) {
+            put(&b, HLE_ZEQ_DECL_GLSL);
+        }
     }
     put(&b, "void main() {\n  vec4 cur = vDiffuse, tmp = vec4(0.0), r;\n");
     if (k->wbuf) {
@@ -600,6 +650,7 @@ size_t hle_ff_ps_glsl(const HleFfPsKey *k, char *buf, size_t cap)
         "    ivec4 r = clamp(dv %s sv, ivec4(-128), ivec4(127));\n"
         "    oColor = vec4(r & 255) / 255.0; }\n", "oColor", k->sblend == 1 ? "+" : "-");
     }
-    put(&b, "%s}\n", k->wbuf ? HLE_WBUF_STORE_GLSL : "");
+    put(&b, "%s}\n", k->wbuf ? hle_wbuf_store_glsl() : "");
+    msl_end(&b, m);
     return b.overflow ? 0 : b.len;
 }

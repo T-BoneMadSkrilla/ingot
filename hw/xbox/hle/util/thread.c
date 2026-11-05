@@ -39,6 +39,37 @@ bool hle_cond_timedwait(HleCond *c, HleMutex *m, int ms)
     return pthread_cond_timedwait(&c->c, &m->m, &ts) == 0;
 }
 
+#ifdef __APPLE__
+void hle_sem_init(HleSem *s, int init)
+{
+    s->s = dispatch_semaphore_create(init);
+}
+
+void hle_sem_destroy(HleSem *s)
+{
+    dispatch_release(s->s);
+}
+
+void hle_sem_post(HleSem *s)
+{
+    dispatch_semaphore_signal(s->s);
+}
+
+void hle_sem_wait(HleSem *s)
+{
+    dispatch_semaphore_wait(s->s, DISPATCH_TIME_FOREVER);
+}
+
+bool hle_sem_trywait(HleSem *s)
+{
+    return dispatch_semaphore_wait(s->s, DISPATCH_TIME_NOW) == 0;
+}
+
+bool hle_sem_timedwait(HleSem *s, int ms)
+{
+    return dispatch_semaphore_wait(s->s, dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms * 1000000)) == 0;
+}
+#else
 void hle_sem_init(HleSem *s, int init)
 {
     sem_init(&s->s, 0, (unsigned)init);
@@ -80,6 +111,7 @@ bool hle_sem_timedwait(HleSem *s, int ms)
     }
     return r == 0;
 }
+#endif
 
 void hle_event_init(HleEvent *e, bool set)
 {

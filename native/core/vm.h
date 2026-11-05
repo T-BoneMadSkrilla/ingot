@@ -16,6 +16,13 @@
 extern "C" {
 #endif
 
+/* A 16 KiB-page host (Apple silicon): the guest's 4 KiB pages are kept in
+ * software (vm16k.c), each host page mapped straight through only when its
+ * four guest pages allow it. */
+#if defined(__APPLE__) && defined(__aarch64__)
+#define NC_VM16K 1
+#endif
+
 #define NC_RAM_RETAIL    (64u << 20)
 #define NC_CONTIG_WINDOW 0x80000000u
 #define NC_GPU_WINDOW    0xF0000000u /* NV2A BAR1: another view of RAM */
@@ -33,6 +40,10 @@ typedef struct NcVm {
     uint32_t *rmap;        /* per physical page: the user VA mapping it (besides the window), or 0 */
     uint8_t *wp;           /* per physical page: dirty tracking's (NC_WP_*); 0 not tracked */
     uint8_t *pin;          /* per physical page: NC_PIN_KNOWN | lock count (nc_vm_pin) */
+#ifdef NC_VM16K
+    uint8_t *vprot;        /* per guest page: the PROT_* the guest's 4 KiB page has (vm16k.c) */
+    struct NcVmBlock *blk; /* per 16 KiB host page of the guest space: how it's mapped */
+#endif
 } NcVm;
 
 /* NcVm.wp: protected in every view, unwritten since; written since (a guest
@@ -118,6 +129,9 @@ static inline uint32_t nc_vm_phys(const NcVm *vm, uint32_t va)
 #define NC_TOP_RESERVE 0x100000u
 
 uint32_t nc_vm_alloc_phys(NcVm *vm, uint32_t len, uint32_t lo, uint32_t hi);
+/* The same for memory to be mapped at va: on a 16 KiB-page host, a run whose
+ * pages fall in the host pages va's do (pa = va mod 16 KiB) when one fits. */
+uint32_t nc_vm_alloc_phys_va(NcVm *vm, uint32_t va, uint32_t len, uint32_t lo, uint32_t hi);
 
 /* Same, with an alignment (power of two, at least a page) and optionally the
  * highest fitting address first. */
@@ -157,6 +171,46 @@ uint32_t nc_vm_free_bytes(const NcVm *vm);
 /* The free physical runs of 64 KiB or more (pa+size), their count and the
  * largest, as text (out-of-memory reports). */
 void nc_vm_free_runs(const NcVm *vm, char *buf, size_t len);
+
+#ifdef NC_VM16K
+#include <signal.h>
+bool nc_vm16k_init(NcVm *vm);
+/* Guest pages [va, va + len) now have prot (their pte as set): the host pages over them follow. */
+void nc_vm16k_protect(NcVm *vm, uint32_t va, uint32_t len, int prot);
+/* The host pages over [va, va + len) after their ptes changed. */
+void nc_vm16k_sync(NcVm *vm, uint32_t va, uint32_t len);
+/* A fault in a host page the guest's pages don't map as one: the access
+ * made through the RAM view when every guest page it touches allows it
+ * (NC_VM16K_DONE), else the host address of the first byte whose page
+ * doesn't in *deny (NC_VM16K_DENIED: the guest's own fault there). */
+enum { NC_VM16K_NOT_MINE, NC_VM16K_DONE, NC_VM16K_DENIED };
+bool nc_vm16k_plain(void);
+int nc_vm16k_fault(NcVm *vm, const siginfo_t *info, void *ucontext, uintptr_t *deny);
+/* direct, trapped, unmapped host pages; accesses emulated so far */
+void nc_vm16k_census(const NcVm *vm, uint32_t *direct, uint32_t *trapped, uint64_t *emulated);
+/* why the trapped host pages are, and the ones emulated most since the last dump */
+void nc_vm16k_dump(const NcVm *vm);
+/* The trapped host pages (their VAs) emulated often since the last take, up to max. */
+unsigned nc_vm16k_want_take(uint32_t *va, unsigned max);
+/* Whether va's host page maps straight through */
+bool nc_vm16k_direct(const NcVm *vm, uint32_t va);
+/* Hot JIT accesses to trapped pages patched to branch to stubs, not fault:
+ * is_jit tells the JIT's code (whose accesses may be patched), tail the room
+ * for stubs past its latest code buffer (gen counting the buffers). */
+typedef struct NcCodeTail {
+    void *base;
+    size_t size;
+    uint64_t gen;
+} NcCodeTail;
+void nc_vm16k_set_jit(bool (*is_jit)(uintptr_t pc), const NcCodeTail *tail);
+void nc_vm16k_site_stats(uint64_t *runs, uint64_t *copies, uint64_t *backs, unsigned *sites);
+/* Those host pages' guest pages, where they can move, moved into a wholly
+ * free host block each, so the host page maps direct. Where pages move
+ * anyway (a kernel call, the guest's code not running). */
+void nc_vm_regroup(NcVm *vm);
+/* Physical page held for an unmapped guest page of a host page mapped direct */
+bool nc_vm_is_fill(uint32_t page);
+#endif
 
 static inline void *nc_vm_host(const NcVm *vm, uint32_t va)
 {

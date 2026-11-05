@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ingot — Original Xbox games on Apple silicon</title>
+  <meta name="description" content="Ingot runs original Xbox games on Macs with Apple silicon, rendered with Metal. Free and open source.">
+  <meta property="og:title" content="Ingot">
+  <meta property="og:description" content="Original Xbox games on Apple silicon, rendered with Metal.">
+  <meta property="og:image" content="icon.png">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="#"><img src="favicon.png" alt="" width="28" height="28">Ingot</a>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#start">Get started</a>
+      <a href="https://github.com/T-BoneMadSkrilla/ingot">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <img class="hero-icon" src="icon-256.png" srcset="icon.png 2x" alt="Ingot app icon" width="200" height="200">
+      <h1>Ingot</h1>
+      <p class="tagline">Original Xbox games on your Mac.<br>Native on Apple silicon, rendered with Metal.</p>
+      <div class="actions">
+        <a class="btn primary" href="https://github.com/T-BoneMadSkrilla/ingot/releases/latest/download/Ingot.zip">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0l-5-5m5 5l5-5M5 21h14"/></svg>
+          Download for Mac
+        </a>
+        <a class="btn" href="https://github.com/T-BoneMadSkrilla/ingot">View source</a>
+      </div>
+      <p class="fine">Free and open source · macOS 14 or later · Apple silicon (M1 or newer)</p>
+    </section>
+
+    <section id="features" class="features">
+      <article>
+        <h3>Built for Metal</h3>
+        <p>The Xbox's GPU commands are translated straight to Metal, no translation layers. Games render at up to 4× native resolution.</p>
+      </article>
+      <article>
+        <h3>Fast x86 JIT</h3>
+        <p>Game code is recompiled to ARM64 on the fly by a FEX-based JIT, with Xbox memory mapped directly onto Apple silicon's 16 KiB pages.</p>
+      </article>
+      <article>
+        <h3>No BIOS needed</h3>
+        <p>Ingot reimplements the Xbox kernel itself. No BIOS, MCPX ROM or hard disk image to hunt down, just your game.</p>
+      </article>
+      <article>
+        <h3>A real Mac app</h3>
+        <p>A SwiftUI game library with cover art, controller support and Core Audio sound. Double-click a game to play.</p>
+      </article>
+    </section>
+
+    <section id="start" class="start">
+      <h2>Get started</h2>
+      <ol>
+        <li><strong>Download</strong> Ingot and drag it to your Applications folder.</li>
+        <li><strong>Open it.</strong> The first time, right-click Ingot and choose <em>Open</em>, since the app isn't notarized yet.</li>
+        <li><strong>Add your games.</strong> Put your ISO or XISO disc images in <code>~/Documents/xbox</code>, or add a folder in Settings.</li>
+        <li><strong>Play.</strong> Double-click a game in the library.</li>
+      </ol>
+      <p class="note">Ingot doesn't include any games or copyrighted Xbox software. Use images dumped from discs you own.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p>Ingot is free software under the <a href="https://www.gnu.org/licenses/gpl-3.0.html">GNU GPL v3</a>, a fork of <a href="https://github.com/rfandango/hakuX">hakuX</a> by rfandango. Audio from <a href="https://xemu.app">xemu</a>.</p>
+    <p>Not affiliated with Microsoft. “Xbox” is a trademark of Microsoft.</p>
+  </footer>
+</body>
+</html>

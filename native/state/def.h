@@ -35,6 +35,10 @@
  * sizes from the assembly instead) */
 #ifdef NC_STATE_PROBE
 #define NC_REC(T, size) const unsigned long nc_probe_size_##T = sizeof(T);
+#elif defined(__APPLE__)
+/* Darwin's pthread types are larger than bionic's: the records' sizes (the
+ * savestate format) are Android's, so they aren't checked here. */
+#define NC_REC(T, size)
 #else
 #define NC_REC(T, size)                                                                            \
     _Static_assert(sizeof(T) == (size), #T " changed size: list its new member in its .def (NC_F or " \

@@ -691,9 +691,15 @@ bool hle_present_begin(struct ANativeWindow *win, uint32_t *w, uint32_t *h)
     if (win != g_ps.win && (!win || hle_now_ns() - g_ps.lost_ns > 250000000ll)) {
         drop_window();
         if (win) {
+#ifdef __APPLE__
+            VkMetalSurfaceCreateInfoEXT sci = { .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
+                                                .pLayer = win->layer };
+            if (vkCreateMetalSurfaceEXT(g_hvk.inst, &sci, NULL, &g_ps.surf) != VK_SUCCESS) {
+#else
             VkAndroidSurfaceCreateInfoKHR sci = { .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
                                                   .window = win };
             if (vkCreateAndroidSurfaceKHR(g_hvk.inst, &sci, NULL, &g_ps.surf) != VK_SUCCESS) {
+#endif
                 g_ps.surf = VK_NULL_HANDLE;
                 g_ps.lost_ns = hle_now_ns();
                 hle_log("hakuX-hle-back", "present: no surface for the window");

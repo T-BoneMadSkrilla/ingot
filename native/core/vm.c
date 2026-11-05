@@ -7,12 +7,27 @@
 #include <dlfcn.h>
 
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 static uint8_t *g_na;   /* per physical page: no guest access (nc_vm_noaccess), made on first use */
+/* Write tracking's flag and the views' protection change together: a page
+ * opened by a guest store's fault while the GPU thread protects it again
+ * otherwise ends read-only with its flag clear, the next store a crash. */
+static pthread_mutex_t g_prot_mu = PTHREAD_MUTEX_INITIALIZER;
+#ifdef NC_VM16K
+/* per physical page: held for the unmapped guest page at its place in a
+ * host page mapped direct (nc_vm_regroup), until that guest page is mapped */
+static uint8_t *g_fill;
+static uint32_t g_nfill;
+#define NC_FILL_MAX 1024u
+#endif
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 1u
@@ -22,7 +37,29 @@ static uint8_t *g_na;   /* per physical page: no guest access (nc_vm_noaccess), 
 
 static int memfd(const char *name)
 {
+#ifdef __APPLE__
+    /* a shared-memory object, unlinked at once: as anonymous as a memfd */
+    char path[64];
+    snprintf(path, sizeof(path), "/%s-%d", name, (int)getpid());
+    const int fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+        shm_unlink(path);
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+    return fd;
+#else
     return (int)syscall(__NR_memfd_create, name, MFD_CLOEXEC);
+#endif
+}
+
+/* The guest's view of [va, va + len) gets prot (one page or a run of them). */
+static void guest_protect(NcVm *vm, uint32_t va, size_t len, int prot)
+{
+#ifdef NC_VM16K
+    nc_vm16k_protect(vm, va, (uint32_t)len, prot);
+#else
+    mprotect(vm->base + va, len, prot);
+#endif
 }
 
 bool nc_vm_init(NcVm *vm, uint32_t ram_size)
@@ -62,6 +99,11 @@ bool nc_vm_init(NcVm *vm, uint32_t ram_size)
     if (!vm->page_used || !vm->pte || !vm->rmap || !vm->wp || !vm->pin) {
         return false;
     }
+#ifdef NC_VM16K
+    if (!nc_vm16k_init(vm)) {
+        return false;
+    }
+#endif
 
     /* Host code's own view of RAM, outside the guest's address space: never
      * write-protected (dirty tracking applies to guest accesses). */
@@ -95,6 +137,7 @@ bool nc_vm_map(NcVm *vm, uint32_t va, uint32_t pa, uint32_t len)
         nc_log("hakuX-native", "vm: bad map va=%08x pa=%08x len=%x", va, pa, len);
         return false;
     }
+#ifndef NC_VM16K
     void *want = vm->base + va;
     void *m = mmap(want, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, vm->ram_fd, pa);
     if (m != want) {
@@ -102,6 +145,7 @@ bool nc_vm_map(NcVm *vm, uint32_t va, uint32_t pa, uint32_t len)
                strerror(errno));
         return false;
     }
+#endif
     const bool window = va == NC_CONTIG_WINDOW || va == NC_GPU_WINDOW;
     for (uint32_t off = 0; off < len; off += NC_PAGE) {
         const uint32_t page = (pa + off) / NC_PAGE;
@@ -118,12 +162,20 @@ bool nc_vm_map(NcVm *vm, uint32_t va, uint32_t pa, uint32_t len)
             }
             vm->rmap[page] = va + off;
         }
+#ifdef NC_VM16K
+        vm->vprot[(va + off) / NC_PAGE] = g_na && g_na[page] ? PROT_NONE
+                                          : vm->wp[page] == NC_WP_CLEAN ? PROT_READ : PROT_READ | PROT_WRITE;
+#else
         if (g_na && g_na[page]) {
             mprotect(vm->base + va + off, NC_PAGE, PROT_NONE); /* still no access (nc_vm_noaccess) */
         } else if (vm->wp[page] == NC_WP_CLEAN) {
             mprotect(vm->base + va + off, NC_PAGE, PROT_READ); /* still tracked */
         }
+#endif
     }
+#ifdef NC_VM16K
+    nc_vm16k_sync(vm, va, len);
+#endif
     return true;
 }
 
@@ -137,8 +189,8 @@ NcVmDma nc_vm_dma;
 
 static void prot_views(NcVm *vm, uint32_t page, uint32_t n, int prot)
 {
-    mprotect(vm->base + NC_CONTIG_WINDOW + page * NC_PAGE, (size_t)n * NC_PAGE, prot);
-    mprotect(vm->base + NC_GPU_WINDOW + page * NC_PAGE, (size_t)n * NC_PAGE, prot);
+    guest_protect(vm, NC_CONTIG_WINDOW + page * NC_PAGE, (size_t)n * NC_PAGE, prot);
+    guest_protect(vm, NC_GPU_WINDOW + page * NC_PAGE, (size_t)n * NC_PAGE, prot);
     uint32_t run_va = 0, run_n = 0;
     for (uint32_t i = 0; i <= n; i++) {
         uint32_t va = 0;
@@ -153,7 +205,7 @@ static void prot_views(NcVm *vm, uint32_t page, uint32_t n, int prot)
             continue;
         }
         if (run_n) {
-            mprotect(vm->base + run_va, (size_t)run_n * NC_PAGE, prot);
+            guest_protect(vm, run_va, (size_t)run_n * NC_PAGE, prot);
         }
         run_va = va;
         run_n = va ? 1 : 0;
@@ -167,6 +219,7 @@ void nc_vm_protect_pages(NcVm *vm, uint32_t pa, uint32_t n, bool ro)
     }
     const uint32_t page = pa / NC_PAGE;
     const int prot = ro ? PROT_READ : PROT_READ | PROT_WRITE;
+    pthread_mutex_lock(&g_prot_mu);
     /* The flag is set before the pages are protected and cleared after
      * they're writable again: a guest store that faults on another thread
      * meanwhile always finds its page marked (dirty.c takes the fault as a
@@ -201,6 +254,7 @@ void nc_vm_protect_pages(NcVm *vm, uint32_t pa, uint32_t n, bool ro)
             __atomic_store_n(&vm->wp[page + i], 0, __ATOMIC_RELEASE);
         }
     }
+    pthread_mutex_unlock(&g_prot_mu);
 }
 
 void nc_vm_noaccess(NcVm *vm, uint32_t pa, uint32_t n, bool on)
@@ -219,12 +273,14 @@ void nc_vm_noaccess(NcVm *vm, uint32_t pa, uint32_t n, bool on)
             free(na);
         }
     }
+    pthread_mutex_lock(&g_prot_mu);
     if (on) {
         /* marked first: a fault meanwhile finds its page marked */
         for (uint32_t i = 0; i < n; i++) {
             __atomic_store_n(&g_na[page + i], 1, __ATOMIC_RELEASE);
         }
         prot_views(vm, page, n, PROT_NONE);
+        pthread_mutex_unlock(&g_prot_mu);
         return;
     }
     /* back to what write tracking wants, in runs of the same */
@@ -240,6 +296,7 @@ void nc_vm_noaccess(NcVm *vm, uint32_t pa, uint32_t n, bool on)
     for (uint32_t i = 0; i < n; i++) {
         __atomic_store_n(&g_na[page + i], 0, __ATOMIC_RELEASE);
     }
+    pthread_mutex_unlock(&g_prot_mu);
 }
 
 bool nc_vm_noaccess_has(NcVm *vm, uint32_t pa)
@@ -254,11 +311,13 @@ void nc_vm_protect_page(NcVm *vm, uint32_t pa, bool ro)
 
 bool nc_vm_unmap(NcVm *vm, uint32_t va, uint32_t len)
 {
+#ifndef NC_VM16K
     void *want = vm->base + va;
     if (mmap(want, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1,
              0) != want) {
         return false;
     }
+#endif
     for (uint32_t off = 0; off < len; off += NC_PAGE) {
         const uint32_t e = vm->pte[(va + off) / NC_PAGE];
         if ((e & NC_PTE_VALID) && vm->rmap[e / NC_PAGE] == va + off) {
@@ -266,6 +325,9 @@ bool nc_vm_unmap(NcVm *vm, uint32_t va, uint32_t len)
         }
         vm->pte[(va + off) / NC_PAGE] = 0;
     }
+#ifdef NC_VM16K
+    nc_vm16k_sync(vm, va, len);
+#endif
     return true;
 }
 
@@ -335,6 +397,9 @@ uint32_t nc_vm_alloc_phys_ex(NcVm *vm, uint32_t len, uint32_t lo, uint32_t hi, u
 }
 
 static uint32_t free_pages(const NcVm *vm);
+#ifdef NC_VM16K
+static void fill_release(NcVm *vm, uint32_t first, uint32_t pages);
+#endif
 
 void nc_vm_free_phys(NcVm *vm, uint32_t pa, uint32_t len)
 {
@@ -352,6 +417,9 @@ void nc_vm_free_phys(NcVm *vm, uint32_t pa, uint32_t len)
         }
         memset(vm->page_used + pa / NC_PAGE, 0, pages);
         memset(vm->pin + pa / NC_PAGE, 0, pages);
+#ifdef NC_VM16K
+        fill_release(vm, pa / NC_PAGE, pages);
+#endif
         if (nc_vm_free_hook) {
             nc_vm_free_hook(pa, pages * NC_PAGE);
         }
@@ -392,6 +460,118 @@ static bool takes_move(const NcVm *vm, uint32_t p)
     return !vm->page_used[p] && !(g_na && g_na[p]);
 }
 
+#ifdef NC_VM16K
+#define NC_HOST_PAGES (16384u / NC_PAGE)
+
+/* The free physical page that, at va, completes the host block the other
+ * pages of va's host page are mapped from (native/core/vm16k.c maps a host
+ * page straight through only when it is one such block), or UINT32_MAX. */
+bool nc_vm16k_plain(void)   /* NC_VM16K_PLAIN: no host-page-aware layout (A/B) */
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("NC_VM16K_PLAIN") != NULL;
+    }
+    return on;
+}
+
+bool nc_vm_is_fill(uint32_t page)
+{
+    return g_fill && g_fill[page];
+}
+
+/* A held page given to the guest page it was held for (page_used stays set) */
+static void fill_take(uint32_t page)
+{
+    if (g_fill && g_fill[page]) {
+        g_fill[page] = 0;
+        g_nfill--;
+    }
+}
+
+static uint32_t neighbor_page(const NcVm *vm, uint32_t va)
+{
+    if (nc_vm16k_plain()) {
+        return UINT32_MAX;
+    }
+    const uint32_t vp = va / NC_PAGE, off = vp & (NC_HOST_PAGES - 1), ram_pages = vm->ram_size / NC_PAGE;
+    for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+        const uint32_t e = vm->pte[vp - off + i];
+        if (i == off || !(e & NC_PTE_VALID)) {
+            continue;
+        }
+        const uint32_t pp = e / NC_PAGE, t = pp - i + off;
+        if ((pp & (NC_HOST_PAGES - 1)) == i && t < ram_pages && (takes_move(vm, t) || nc_vm_is_fill(t))) {
+            return t;
+        }
+    }
+    return UINT32_MAX;
+}
+
+static bool block_free(const NcVm *vm, uint32_t b, uint32_t w0, uint32_t w1)
+{
+    const uint32_t p = b * NC_HOST_PAGES;
+    if (p < w1 && p + NC_HOST_PAGES > w0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+        if (!takes_move(vm, p + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The highest wholly free host block below *b and at or above lo, outside
+ * pages [w0, w1): *b, from which the next search goes on (what it passed
+ * stays taken while a window's pages move), or UINT32_MAX. */
+static uint32_t free_block_down(const NcVm *vm, uint32_t *b, uint32_t lo, uint32_t w0, uint32_t w1)
+{
+    while (*b > lo) {
+        if (block_free(vm, --*b, w0, w1)) {
+            return *b;
+        }
+    }
+    return UINT32_MAX;
+}
+
+static uint32_t free_block_up(const NcVm *vm, uint32_t *b, uint32_t hi, uint32_t w0, uint32_t w1)
+{
+    for (; *b < hi; ++*b) {
+        if (block_free(vm, *b, w0, w1)) {
+            return (*b)++;
+        }
+    }
+    return UINT32_MAX;
+}
+
+/* Where moved page q goes so its host page stays one block: beside its
+ * neighbors, else in a wholly free block at its offset (its neighbors
+ * follow it there), or UINT32_MAX. */
+static uint32_t move_target(const NcVm *vm, uint32_t q, uint32_t w0, uint32_t w1, uint32_t *down, uint32_t *up,
+                            uint32_t below)
+{
+    if (nc_vm16k_plain()) {
+        return UINT32_MAX;
+    }
+    const uint32_t va = vm->rmap[q], off = (va / NC_PAGE) & (NC_HOST_PAGES - 1);
+    uint32_t t = neighbor_page(vm, va);
+    if (t != UINT32_MAX && (t < w0 || t >= w1)) {
+        return t;
+    }
+    uint32_t b = UINT32_MAX;
+    if (down) {
+        b = free_block_down(vm, &down[0], 0, w0, w1);
+        if (b == UINT32_MAX) {
+            b = free_block_down(vm, &down[1], below / NC_HOST_PAGES, w0, w1);
+        }
+    } else {
+        b = free_block_up(vm, up, vm->ram_size / NC_PAGE / NC_HOST_PAGES, w0, w1);
+    }
+    return b != UINT32_MAX ? b * NC_HOST_PAGES + off : UINT32_MAX;
+}
+#endif
+
 /* Movable page q's contents, and the VA mapping it, to free page `to`.
  * Write tracking follows physical pages, freed ones too, and the HLE knows
  * them by physical address: GPU work may still read either page in place,
@@ -411,6 +591,9 @@ static bool relocate(NcVm *vm, uint32_t q, uint32_t to)
     }
     const uint32_t va = vm->rmap[q];
     memcpy(vm->ram + (size_t)to * NC_PAGE, vm->ram + (size_t)q * NC_PAGE, NC_PAGE);
+#ifdef NC_VM16K
+    fill_take(to);
+#endif
     vm->page_used[to] = 1;
     if (!nc_vm_map(vm, va, to * NC_PAGE, NC_PAGE)) {
         vm->page_used[to] = 0;
@@ -424,6 +607,410 @@ static bool relocate(NcVm *vm, uint32_t q, uint32_t to)
     }
     return true;
 }
+
+#ifdef NC_VM16K
+/* Virtual memory committed a page at a time as RAM runs short scatters over
+ * whatever pages are free, and its host pages are trapped: Halo's heap,
+ * filled through the first level's load, had each of its accesses emulated
+ * (450k a second, 7 fps). From the highest wholly free blocks below the
+ * top reserve, as virtual memory packs at the top. */
+/* Held pages go back once none of their block is in use. */
+static void fill_release(NcVm *vm, uint32_t first, uint32_t pages)
+{
+    if (!g_nfill) {
+        return;
+    }
+    for (uint32_t b = first / NC_HOST_PAGES; b <= (first + pages - 1) / NC_HOST_PAGES; b++) {
+        bool held = false, used = false;
+        for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+            const uint32_t p = b * NC_HOST_PAGES + i;
+            held |= g_fill[p] != 0;
+            used |= vm->page_used[p] && !g_fill[p];
+        }
+        if (held && !used) {
+            for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+                const uint32_t p = b * NC_HOST_PAGES + i;
+                if (g_fill[p]) {
+                    g_fill[p] = 0;
+                    vm->page_used[p] = 0;
+                    g_nfill--;
+                }
+            }
+        }
+    }
+}
+
+/* Held pages of blocks no longer mapped straight through (their pages
+ * freed, moved, or a gap mapped from elsewhere) go back: the host pages they
+ * were held for are trapped already. */
+static bool needs_hold(const NcVm *vm, uint32_t vp);
+
+static void fill_sweep(NcVm *vm)
+{
+    const uint32_t blocks = vm->ram_size / NC_PAGE / NC_HOST_PAGES;
+    for (uint32_t b = 0; b < blocks && g_nfill; b++) {
+        const uint32_t p0 = b * NC_HOST_PAGES;
+        bool held = false;
+        for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+            held |= g_fill[p0 + i] != 0;
+        }
+        if (!held) {
+            continue;
+        }
+        /* live: every other page of the block mapped at its offset of one
+         * host page, whose gaps are the held pages' places */
+        bool live = true;
+        uint32_t vbase = UINT32_MAX;
+        for (uint32_t i = 0; i < NC_HOST_PAGES && live; i++) {
+            const uint32_t p = p0 + i, va = vm->rmap[p];
+            if (g_fill[p]) {
+                continue;
+            }
+            live = vm->page_used[p] && va && vm->pte[va / NC_PAGE] == ((p * NC_PAGE) | NC_PTE_VALID) &&
+                   (va / NC_PAGE) % NC_HOST_PAGES == i && (vbase == UINT32_MAX || vbase == va / NC_PAGE - i);
+            vbase = va / NC_PAGE - i;
+        }
+        for (uint32_t i = 0; i < NC_HOST_PAGES && live; i++) {
+            live = vbase != UINT32_MAX && (!g_fill[p0 + i] || needs_hold(vm, vbase + i));
+        }
+        if (live) {
+            continue;
+        }
+        for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+            if (g_fill[p0 + i]) {
+                g_fill[p0 + i] = 0;
+                vm->page_used[p0 + i] = 0;
+                g_nfill--;
+            }
+        }
+    }
+}
+
+/* RAM run out: every held page back to the title, their host pages trapped
+ * again (synced before the pages are handed out). False if none was held. */
+static bool fill_drop_all(NcVm *vm)
+{
+    if (!g_nfill) {
+        return false;
+    }
+    const uint32_t blocks = vm->ram_size / NC_PAGE / NC_HOST_PAGES;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint32_t p0 = b * NC_HOST_PAGES;
+        uint32_t va = 0;
+        bool held = false;
+        for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+            const uint32_t p = p0 + i;
+            if (g_fill[p]) {
+                g_fill[p] = 0;
+                vm->page_used[p] = 0;
+                held = true;
+            } else if (vm->page_used[p] && vm->rmap[p]) {
+                va = vm->rmap[p] & ~(NC_HOST_PAGES * NC_PAGE - 1);
+            }
+        }
+        if (held && va) {
+            nc_vm16k_sync(vm, va, NC_HOST_PAGES * NC_PAGE);
+        }
+    }
+    nc_log("hakuX-native-vm16k", "RAM short: %u held pages given back", g_nfill);
+    g_nfill = 0;
+    return true;
+}
+
+/* At most an eighth of the free pages held, the title running short first. */
+static bool fill_room(NcVm *vm, uint32_t need)
+{
+    const uint32_t room = g_nfill + free_pages(vm) / 8, cap = room < NC_FILL_MAX ? room : NC_FILL_MAX;
+    if (g_nfill + need > cap) {
+        fill_sweep(vm);
+    }
+    return g_nfill + need <= cap;
+}
+
+/* An unmapped guest page whose place in its host block needs holding: one
+ * the guest may access (committed, its page not in yet). One it has no
+ * access to may share its place with any page (native/core/vm16k.c). */
+static bool needs_hold(const NcVm *vm, uint32_t vp)
+{
+    return !(vm->pte[vp] & NC_PTE_VALID) && vm->vprot[vp];
+}
+
+/* A partly mapped host page whose pages already sit at their offsets in an
+ * aligned block, the block's other pages free: those held, no copy (the
+ * pages needn't be movable). */
+static bool fill_in_place(NcVm *vm, uint32_t vp)
+{
+    const uint32_t ram_pages = vm->ram_size / NC_PAGE;
+    uint32_t base = UINT32_MAX, holes = 0;
+    for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+        const uint32_t e = vm->pte[vp + i];
+        if (!(e & NC_PTE_VALID)) {
+            holes++;
+            continue;
+        }
+        const uint32_t b0 = e / NC_PAGE - i;
+        if (e / NC_PAGE < i || (b0 & (NC_HOST_PAGES - 1)) || (base != UINT32_MAX && b0 != base)) {
+            return false;
+        }
+        base = b0;
+    }
+    if (base == UINT32_MAX || !holes || base + NC_HOST_PAGES > ram_pages) {
+        return false;
+    }
+    uint32_t need = 0;
+    for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+        if (needs_hold(vm, vp + i) && !g_fill[base + i]) {
+            if (vm->page_used[base + i]) {
+                return false;
+            }
+            need++;
+        }
+    }
+    if (!fill_room(vm, need)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+        if (needs_hold(vm, vp + i) && !g_fill[base + i]) {
+            vm->page_used[base + i] = 1;
+            g_fill[base + i] = 1;
+            g_nfill++;
+        }
+    }
+    return true;
+}
+
+/* A host page's pages gathered into one aligned block with no wholly free
+ * block needed: the block its fixed pages (pinned: the title has their
+ * physical addresses, or DMA does) sit in, else the one most of them do.
+ * What holds their places moves out first, to free pages at the same
+ * offset elsewhere. Forza's race buffers, pinned by MmGetPhysicalAddress,
+ * had each a page or two in other blocks, and its race load, RAM short and
+ * no block free, scattered pages a page at a time making room for
+ * contiguous memory. */
+static uint32_t congruent_fit(const NcVm *vm, uint32_t first, uint32_t last, uint32_t pages, uint32_t want,
+                              bool highest);
+
+static unsigned s_done, s_skipped;   /* regroup's, for its summary */
+static unsigned s_why[6];
+static const char *const k_why[6] = { "fixed pages disagree", "none in place", "a place fixed", "no room to hold",
+                                      "a place direct", "nowhere to move out" };
+
+static bool anchor_fail(unsigned why)
+{
+    s_why[why]++;
+    return false;
+}
+static time_t s_since;
+
+static bool regroup_anchor(NcVm *vm, uint32_t vp)
+{
+    const uint32_t ram_pages = vm->ram_size / NC_PAGE;
+    uint32_t base = UINT32_MAX;
+    for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+        const uint32_t e = vm->pte[vp + i], p = e / NC_PAGE;
+        if (!(e & NC_PTE_VALID) || (p < ram_pages && movable(vm, p))) {
+            continue;
+        }
+        const uint32_t b0 = p - i;
+        if (p >= ram_pages || p < i || (b0 & (NC_HOST_PAGES - 1)) || (base != UINT32_MAX && b0 != base)) {
+            return anchor_fail(0);
+        }
+        base = b0;
+    }
+    if (base == UINT32_MAX) {
+        /* none fixed: the block most of its pages already sit in place in */
+        unsigned best = 0;
+        for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+            const uint32_t e = vm->pte[vp + i], p = e / NC_PAGE;
+            if (!(e & NC_PTE_VALID) || p < i || ((p - i) & (NC_HOST_PAGES - 1))) {
+                continue;
+            }
+            unsigned n = 0;
+            for (uint32_t j = 0; j < NC_HOST_PAGES; j++) {
+                n += (vm->pte[vp + j] & NC_PTE_VALID) && vm->pte[vp + j] / NC_PAGE == p - i + j;
+            }
+            if (n > best) {
+                best = n;
+                base = p - i;
+            }
+        }
+        if (base == UINT32_MAX || base + NC_HOST_PAGES > ram_pages) {
+            return anchor_fail(1);
+        }
+    }
+    /* each place: its page already, free, held, or a movable page (moved
+     * out; one of this host page's own moves on to its place after) */
+    uint32_t need = 0;
+    for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+        const uint32_t e = vm->pte[vp + i], t = base + i;
+        if ((e & NC_PTE_VALID) && e / NC_PAGE == t) {
+            continue;
+        }
+        if (!(e & NC_PTE_VALID) && !needs_hold(vm, vp + i)) {
+            continue;
+        }
+        /* not a page of another host page mapped straight through: they'd
+         * take each other's places in turn */
+        if (vm->page_used[t] && !g_fill[t] && !movable(vm, t)) {
+            return anchor_fail(2);
+        }
+        if (vm->page_used[t] && !g_fill[t] && vm->rmap[t] / NC_PAGE - vp >= NC_HOST_PAGES &&
+            nc_vm16k_direct(vm, vm->rmap[t])) {
+            return anchor_fail(4);
+        }
+        need += !(e & NC_PTE_VALID) && !g_fill[t];
+    }
+    if (need && !fill_room(vm, need)) {
+        return anchor_fail(3);
+    }
+    /* the free places taken first, so no page moving out goes there */
+    bool act[NC_HOST_PAGES] = {false}, claimed[NC_HOST_PAGES] = {false};
+    for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+        const uint32_t e = vm->pte[vp + i], t = base + i;
+        act[i] = !((e & NC_PTE_VALID) && e / NC_PAGE == t) && ((e & NC_PTE_VALID) || needs_hold(vm, vp + i));
+        if (act[i] && !vm->page_used[t]) {
+            vm->page_used[t] = 1;
+            claimed[i] = true;
+        }
+    }
+    bool ok = true;
+    for (uint32_t i = 0; i < NC_HOST_PAGES && ok; i++) {
+        const uint32_t t = base + i;
+        if (act[i] && !claimed[i] && !g_fill[t]) {   /* another host page's: out */
+            const uint32_t dest = congruent_fit(vm, 0, ram_pages, 1, t & (NC_HOST_PAGES - 1), true);
+            ok = dest != UINT32_MAX && relocate(vm, t, dest);
+            if (!ok) {
+                anchor_fail(5);
+            }
+            if (ok) {
+                vm->page_used[t] = 1;
+                claimed[i] = true;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+        const uint32_t e = vm->pte[vp + i], t = base + i;
+        if (!act[i]) {
+            continue;
+        }
+        if (!ok) {
+            if (claimed[i]) {
+                vm->page_used[t] = 0;
+            }
+        } else if (e & NC_PTE_VALID) {
+            ok = relocate(vm, e / NC_PAGE, t);   /* onto its claimed or held place */
+        } else if (!g_fill[t]) {
+            g_fill[t] = 1;
+            g_nfill++;
+        }
+    }
+    return ok;
+}
+
+void nc_vm_regroup(NcVm *vm)
+{
+    uint32_t want[32];
+    const unsigned n = nc_vm16k_want_take(want, 32);
+    if (!n || nc_vm16k_plain()) {
+        return;
+    }
+    const uint32_t ram_pages = vm->ram_size / NC_PAGE;
+    const uint32_t below = NC_TOP_RESERVE / NC_PAGE < ram_pages ? ram_pages - NC_TOP_RESERVE / NC_PAGE : ram_pages;
+    uint32_t down = below / NC_HOST_PAGES;
+    unsigned done = 0;
+    if (!g_fill) {
+        g_fill = calloc(ram_pages, 1);
+    }
+    for (unsigned w = 0; w < n; w++) {
+        const uint32_t vp = want[w] / NC_PAGE;
+        if (fill_in_place(vm, vp) || regroup_anchor(vm, vp)) {
+            nc_vm16k_sync(vm, want[w], NC_HOST_PAGES * NC_PAGE);
+            done++;
+            continue;
+        }
+        bool ok = true;
+        uint32_t holes = 0;
+        for (uint32_t i = 0; i < NC_HOST_PAGES && ok; i++) {
+            const uint32_t e = vm->pte[vp + i];
+            holes += needs_hold(vm, vp + i);
+            ok = !(e & NC_PTE_VALID) || (e / NC_PAGE < ram_pages && movable(vm, e / NC_PAGE));
+        }
+        /* a host page only partly mapped: its unmapped guest pages' places
+         * held (a few, as they're RAM the title doesn't get) */
+        bool any = false;
+        for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+            any |= (vm->pte[vp + i] & NC_PTE_VALID) != 0;
+        }
+        if (!ok || !any || (holes && (!g_fill || !fill_room(vm, holes)))) {
+            s_skipped++;
+            static uint32_t s_seen[32];
+            static unsigned s_logged;
+            bool seen = false;
+            for (unsigned i = 0; i < s_logged && i < 32; i++) {
+                seen |= s_seen[i] == want[w];
+            }
+            if (!seen && s_logged < 32) {
+                s_seen[s_logged++] = want[w];
+                char why[160];
+                int o = 0;
+                for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+                    const uint32_t e = vm->pte[vp + i], p = e / NC_PAGE;
+                    o += snprintf(why + o, sizeof why - o, " %08x%s", e,
+                                  !(e & NC_PTE_VALID) ? ""
+                                  : p >= ram_pages    ? "(rom)"
+                                  : vm->pin[p]        ? "(pinned)"
+                                  : movable(vm, p)    ? ""
+                                                      : "(fixed)");
+                }
+                nc_log("hakuX-native-vm16k", "regroup %08x skipped:%s, %u held", want[w], why, g_nfill);
+            }
+            continue;
+        }
+        const uint32_t b = free_block_down(vm, &down, 0, 0, 0);
+        if (b == UINT32_MAX) {
+            s_skipped += n - w;
+            break;
+        }
+        for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
+            const uint32_t to = b * NC_HOST_PAGES + i;
+            if (needs_hold(vm, vp + i)) {
+                vm->page_used[to] = 1;
+                g_fill[to] = 1;
+                g_nfill++;
+            }
+        }
+        for (uint32_t i = 0; i < NC_HOST_PAGES && ok; i++) {
+            if (vm->pte[vp + i] & NC_PTE_VALID) {
+                ok = relocate(vm, vm->pte[vp + i] / NC_PAGE, b * NC_HOST_PAGES + i);
+            }
+        }
+        nc_vm16k_sync(vm, want[w], NC_HOST_PAGES * NC_PAGE);
+        done += ok;
+    }
+    s_done += done;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - s_since >= 5) {
+        nc_log("hakuX-native-vm16k",
+               "regroup: %u host pages regrouped, %u not, in %lld s (%u pages held, %u KiB free); in place: "
+               "%s %u, %s %u, %s %u, %s %u, %s %u, %s %u",
+               s_done, s_skipped, (long long)(now.tv_sec - s_since), g_nfill, free_pages(vm) * (NC_PAGE >> 10),
+               k_why[0], s_why[0], k_why[1], s_why[1], k_why[2], s_why[2], k_why[3], s_why[3], k_why[4], s_why[4],
+               k_why[5], s_why[5]);
+        uint64_t runs, copies, backs;
+        unsigned sites;
+        uint32_t direct, trapped;
+        uint64_t emulated;
+        nc_vm16k_site_stats(&runs, &copies, &backs, &sites);
+        nc_vm16k_census(vm, &direct, &trapped, &emulated);
+        nc_log("hakuX-native-vm16k", "sites: %u patched, %llu runs, %llu copies run, %llu sent back; %llu accesses emulated",
+               sites, (unsigned long long)runs, (unsigned long long)copies, (unsigned long long)backs, (unsigned long long)emulated);
+        s_since = now.tv_sec;
+        s_done = s_skipped = 0;
+        memset(s_why, 0, sizeof(s_why));
+    }
+}
+#endif
 
 uint32_t nc_vm_alloc_phys_compact(NcVm *vm, uint32_t len, uint32_t lo, uint32_t hi, uint32_t align, uint32_t *moved)
 {
@@ -462,10 +1049,23 @@ uint32_t nc_vm_alloc_phys_compact(NcVm *vm, uint32_t len, uint32_t lo, uint32_t 
      * mapped two addresses onto it: Blinx's model data). */
     const uint32_t ram_pages = vm->ram_size / NC_PAGE;
     uint32_t to = 0;
+#ifdef NC_VM16K
+    uint32_t up = 0;
+#endif
     for (uint32_t p = best; p < best + pages; p++) {
         if (!vm->page_used[p]) {
             continue;
         }
+#ifdef NC_VM16K
+        const uint32_t t = move_target(vm, p, best, best + pages, NULL, &up, 0);
+        if (t != UINT32_MAX) {
+            if (!relocate(vm, p, t)) {
+                return UINT32_MAX;
+            }
+            (*moved)++;
+            continue;
+        }
+#endif
         while (to < ram_pages && (!takes_move(vm, to) || (to >= best && to < best + pages))) {
             to++;
         }
@@ -533,10 +1133,23 @@ uint32_t nc_vm_alloc_phys_top(NcVm *vm, uint32_t len, uint32_t lo, uint32_t hi, 
     const uint32_t below = NC_TOP_RESERVE / NC_PAGE < ram_pages ? ram_pages - NC_TOP_RESERVE / NC_PAGE : ram_pages;
     int64_t to = below;
     bool reserve = false;
+#ifdef NC_VM16K
+    uint32_t down[2] = {below / NC_HOST_PAGES, ram_pages / NC_HOST_PAGES};
+#endif
     for (uint32_t q = p; used && q < p + pages; q++) {
         if (!vm->page_used[q]) {
             continue;
         }
+#ifdef NC_VM16K
+        const uint32_t t = move_target(vm, q, p, p + pages, down, NULL, below);
+        if (t != UINT32_MAX) {
+            if (!relocate(vm, q, t)) {
+                return UINT32_MAX;
+            }
+            (*moved)++;
+            continue;
+        }
+#endif
         for (;;) {
             if (--to < (reserve ? (int64_t)below : 0)) {
                 if (reserve) {
@@ -610,6 +1223,11 @@ uint32_t nc_vm_alloc_phys(NcVm *vm, uint32_t len, uint32_t lo, uint32_t hi)
     const uint32_t first = lo / NC_PAGE, last = (hi < vm->ram_size ? hi : vm->ram_size) / NC_PAGE;
     uint32_t run;
     uint32_t p = smallest_run(vm, first, last, pages, &run);
+#ifdef NC_VM16K
+    if (p == UINT32_MAX && fill_drop_all(vm)) {
+        p = smallest_run(vm, first, last, pages, &run);
+    }
+#endif
     if (p == UINT32_MAX) {
         return UINT32_MAX;
     }
@@ -617,6 +1235,75 @@ uint32_t nc_vm_alloc_phys(NcVm *vm, uint32_t len, uint32_t lo, uint32_t hi)
     check_unmapped(vm, p, pages, __builtin_return_address(0));
     memset(vm->page_used + p, 1, pages);
     return p * NC_PAGE;
+}
+
+#ifdef NC_VM16K
+/* The highest start s in free run [p, q) for `pages` pages with s = want
+ * (mod NC_HOST_PAGES), or UINT32_MAX. */
+static uint32_t congruent_start(uint32_t p, uint32_t q, uint32_t pages, uint32_t want)
+{
+    if (q - p < pages) {
+        return UINT32_MAX;
+    }
+    const uint32_t s = q - pages, t = s - ((s - want) & (NC_HOST_PAGES - 1));
+    return t >= p && t <= s ? t : UINT32_MAX;
+}
+
+/* In pages [first, last): the best fit (smallest run, the highest of equals)
+ * or the highest start, among starts congruent to want. */
+static uint32_t congruent_fit(const NcVm *vm, uint32_t first, uint32_t last, uint32_t pages, uint32_t want,
+                              bool highest)
+{
+    uint32_t best = UINT32_MAX, best_len = UINT32_MAX;
+    for (uint32_t p = first; p < last;) {
+        if (vm->page_used[p]) {
+            p++;
+            continue;
+        }
+        uint32_t q = p;
+        while (q < last && !vm->page_used[q]) {
+            q++;
+        }
+        const uint32_t s = congruent_start(p, q, pages, want);
+        if (s != UINT32_MAX && (highest || q - p <= best_len)) {
+            best = s;
+            best_len = q - p;
+        }
+        p = q;
+    }
+    return best;
+}
+#endif
+
+uint32_t nc_vm_alloc_phys_va(NcVm *vm, uint32_t va, uint32_t len, uint32_t lo, uint32_t hi)
+{
+#ifdef NC_VM16K
+    const uint32_t pages = nc_align_up(len ? len : 1, NC_PAGE) / NC_PAGE;
+    const uint32_t first = lo / NC_PAGE, last = (hi < vm->ram_size ? hi : vm->ram_size) / NC_PAGE;
+    const uint32_t n = neighbor_page(vm, va);
+    if (n != UINT32_MAX && n >= first && n + pages <= last &&
+        (n & (NC_HOST_PAGES - 1)) + pages <= NC_HOST_PAGES) {
+        uint32_t i = 1;
+        while (i < pages && (takes_move(vm, n + i) || nc_vm_is_fill(n + i))) {
+            i++;
+        }
+        if (i == pages) {
+            for (i = 0; i < pages; i++) {
+                fill_take(n + i);
+            }
+            check_unmapped(vm, n, pages, __builtin_return_address(0));
+            memset(vm->page_used + n, 1, pages);
+            return n * NC_PAGE;
+        }
+    }
+    const uint32_t p = congruent_fit(vm, first, last, pages, (va / NC_PAGE) & (NC_HOST_PAGES - 1), false);
+    if (p != UINT32_MAX) {
+        check_unmapped(vm, p, pages, __builtin_return_address(0));
+        memset(vm->page_used + p, 1, pages);
+        return p * NC_PAGE;
+    }
+#endif
+    return nc_vm_alloc_phys(vm, len, lo, hi);
 }
 
 /* The kernel's own blocks of more than a page (large Ex blocks, pool chunks)
@@ -686,9 +1373,36 @@ bool nc_vm_alloc_at(NcVm *vm, uint32_t va, uint32_t len, uint32_t *pa_out)
     const uint32_t ram_pages = vm->ram_size / NC_PAGE;
     for (uint32_t done = 0; done < len;) {
         uint32_t piece = len - done, pa = UINT32_MAX;
+#ifdef NC_VM16K
+        /* beside the pages of its host page already mapped; else the
+         * highest free run that lands in va's host pages (below the reserve,
+         * else in it), halved until one does */
+        if (!pa_out && (pa = neighbor_page(vm, va + done)) != UINT32_MAX) {
+            piece = NC_PAGE;
+            fill_take(pa);
+            vm->page_used[pa] = 1;
+            pa *= NC_PAGE;
+        }
+        if (!pa_out && pa == UINT32_MAX) {
+            const uint32_t want = ((va + done) / NC_PAGE) & (NC_HOST_PAGES - 1);
+            const uint32_t reserve = NC_TOP_RESERVE / NC_PAGE < ram_pages ? NC_TOP_RESERVE / NC_PAGE : 0;
+            for (uint32_t n = piece; n >= NC_PAGE && pa == UINT32_MAX;
+                 n = n > NC_PAGE ? nc_align_up(n / 2, NC_PAGE) : 0) {
+                uint32_t p = congruent_fit(vm, 0, ram_pages - reserve, n / NC_PAGE, want, true);
+                if (p == UINT32_MAX) {
+                    p = congruent_fit(vm, ram_pages - reserve, ram_pages, n / NC_PAGE, want, true);
+                }
+                if (p != UINT32_MAX) {
+                    piece = n;
+                    memset(vm->page_used + p, 1, piece / NC_PAGE);
+                    pa = p * NC_PAGE;
+                }
+            }
+        }
+#endif
         if (pa_out) {
-            pa = nc_vm_alloc_phys(vm, piece, 0, vm->ram_size);
-        } else {
+            pa = nc_vm_alloc_phys_va(vm, va + done, piece, 0, vm->ram_size);
+        } else if (pa == UINT32_MAX) {
             /* the highest free page below the reserve, else in it */
             const uint32_t reserve = NC_TOP_RESERVE / NC_PAGE < ram_pages ? NC_TOP_RESERVE / NC_PAGE : 0;
             uint32_t top = UINT32_MAX;
@@ -713,6 +1427,11 @@ bool nc_vm_alloc_at(NcVm *vm, uint32_t va, uint32_t len, uint32_t *pa_out)
                 pa = p * NC_PAGE;
             }
         }
+#ifdef NC_VM16K
+        if (pa == UINT32_MAX && fill_drop_all(vm)) {
+            continue;
+        }
+#endif
         if (pa == UINT32_MAX) {
             nc_log("hakuX-native", "vm: out of physical memory for %u KiB at %08x (%u KiB free)", len >> 10, va,
                    free_pages(vm) * (NC_PAGE >> 10));

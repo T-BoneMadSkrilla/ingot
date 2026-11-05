@@ -22,6 +22,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -51,7 +52,15 @@ static struct {
 static bool lan_init(void)
 {
     const NcNetConfig *c = nc_net_config();
+    #ifdef __APPLE__
+    g_lan.fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_lan.fd >= 0) {
+        fcntl(g_lan.fd, F_SETFL, fcntl(g_lan.fd, F_GETFL) | O_NONBLOCK);
+        fcntl(g_lan.fd, F_SETFD, FD_CLOEXEC);
+    }
+    #else
     g_lan.fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    #endif
     if (g_lan.fd < 0) {
         nc_log("hakuX-native-net", "lan: socket: %s", strerror(errno));
         return false;

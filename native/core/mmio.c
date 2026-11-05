@@ -11,7 +11,7 @@
 #include <time.h>
 
 #include <stdio.h>
-#include <ucontext.h>
+#include "native/core/hostctx.h"
 #include <unistd.h>
 
 #define MAX_DEVS  16
@@ -183,18 +183,6 @@ static bool decode(uint32_t insn, Access *a)
     return decode_single(insn, a) || decode_pair(insn, a);
 }
 
-/* The FP/SIMD register file in the signal frame. */
-static struct fpsimd_context *fpsimd(ucontext_t *uc)
-{
-    struct _aarch64_ctx *h = (struct _aarch64_ctx *)uc->uc_mcontext.__reserved;
-    while (h->magic) {
-        if (h->magic == FPSIMD_MAGIC) {
-            return (struct fpsimd_context *)h;
-        }
-        h = (struct _aarch64_ctx *)((uint8_t *)h + h->size);
-    }
-    return NULL;
-}
 
 bool nc_mmio_fault(const NcVm *vm, const siginfo_t *info, void *ucontext)
 {
@@ -206,8 +194,7 @@ bool nc_mmio_fault(const NcVm *vm, const siginfo_t *info, void *ucontext)
     if (!dev) {
         return false;
     }
-    ucontext_t *uc = ucontext;
-    mcontext_t *mc = &uc->uc_mcontext;
+    NcHostRegs *mc = nc_host_regs(ucontext);
     Access a;
     if (!decode(*(const uint32_t *)(uintptr_t)mc->pc, &a)) {
         return false;
@@ -216,7 +203,7 @@ bool nc_mmio_fault(const NcVm *vm, const siginfo_t *info, void *ucontext)
         mc->pc += 4;
         return true;
     }
-    struct fpsimd_context *fp = a.fp ? fpsimd(uc) : NULL;
+    __uint128_t *fp = a.fp ? nc_host_vregs(ucontext) : NULL;
     if (a.fp && !fp) {
         return false;
     }
@@ -238,25 +225,25 @@ bool nc_mmio_fault(const NcVm *vm, const siginfo_t *info, void *ucontext)
         const uint32_t off = first + e * a.bytes - dev->base;
         if (a.bytes == 16) {
             if (a.store) {
-                const __uint128_t q = fp->vregs[rt];
+                const __uint128_t q = fp[rt];
                 dev->write(dev->opaque, off, (uint64_t)q, 8);
                 dev->write(dev->opaque, off + 8, (uint64_t)(q >> 64), 8);
                 v = (uint64_t)q;
             } else {
                 const uint64_t lo = dev->read(dev->opaque, off, 8), hi = dev->read(dev->opaque, off + 8, 8);
-                fp->vregs[rt] = (__uint128_t)lo | ((__uint128_t)hi << 64);
+                fp[rt] = (__uint128_t)lo | ((__uint128_t)hi << 64);
                 v = lo;
             }
             continue;
         }
         const uint64_t mask = a.bytes < 8 ? (1ull << (8 * a.bytes)) - 1 : ~0ull;
         if (a.store) {
-            v = (a.fp ? (uint64_t)fp->vregs[rt] : rt == 31 ? 0 : mc->regs[rt]) & mask;
+            v = (a.fp ? (uint64_t)fp[rt] : rt == 31 ? 0 : mc->regs[rt]) & mask;
             dev->write(dev->opaque, off, v, a.bytes);
         } else {
             v = dev->read(dev->opaque, off, a.bytes) & mask;
             if (a.fp) {
-                fp->vregs[rt] = (__uint128_t)v;
+                fp[rt] = (__uint128_t)v;
             } else if (rt != 31) {
                 uint64_t r = v;
                 if (a.sign) {
@@ -310,7 +297,7 @@ bool nc_mmio_fault(const NcVm *vm, const siginfo_t *info, void *ucontext)
 /* The host address a decoded load or store's first element is at: its base
  * register and offset (the fault address may lie further in, an access
  * that crosses into the page that faulted, or be either of a pair's) */
-static bool access_ea(uint32_t insn, const Access *a, const mcontext_t *mc, uint64_t *ea)
+static bool access_ea(uint32_t insn, const Access *a, const NcHostRegs *mc, uint64_t *ea)
 {
     const uint64_t base = a->rn == 31 ? mc->sp : mc->regs[a->rn];
     if (a->count == 2) {
@@ -346,7 +333,7 @@ static bool access_ea(uint32_t insn, const Access *a, const mcontext_t *mc, uint
 
 /* The access's first element's guest address, the fault address within
  * the access */
-static bool ram_first(const NcVm *vm, const siginfo_t *info, const mcontext_t *mc, uint32_t insn,
+static bool ram_first(const NcVm *vm, const siginfo_t *info, const NcHostRegs *mc, uint32_t insn,
                       const Access *a, uint32_t *first)
 {
     uint64_t ea;
@@ -368,7 +355,7 @@ static bool ram_first(const NcVm *vm, const siginfo_t *info, const mcontext_t *m
 bool nc_ram_access_span(const NcVm *vm, const siginfo_t *info, void *ucontext, uint32_t *lo,
                         uint32_t *hi, bool *store)
 {
-    const mcontext_t *mc = &((ucontext_t *)ucontext)->uc_mcontext;
+    const NcHostRegs *mc = nc_host_regs(ucontext);
     Access a;
     uint32_t first;
     const uint32_t insn = *(const uint32_t *)(uintptr_t)mc->pc;
@@ -388,15 +375,14 @@ bool nc_ram_access_span(const NcVm *vm, const siginfo_t *info, void *ucontext, u
 bool nc_ram_emulate(NcVm *vm, const siginfo_t *info, void *ucontext,
                     void (*stored)(uint32_t pa, uint32_t n))
 {
-    ucontext_t *uc = ucontext;
-    mcontext_t *mc = &uc->uc_mcontext;
+    NcHostRegs *mc = nc_host_regs(ucontext);
     Access a;
     uint32_t first;
     const uint32_t insn = *(const uint32_t *)(uintptr_t)mc->pc;
     if (!decode(insn, &a) || a.prefetch || !ram_first(vm, info, mc, insn, &a, &first)) {
         return false;
     }
-    struct fpsimd_context *fp = a.fp ? fpsimd(uc) : NULL;
+    __uint128_t *fp = a.fp ? nc_host_vregs(ucontext) : NULL;
     const uint32_t n = a.count * a.bytes, pa = nc_vm_phys(vm, first);
     if ((a.fp && !fp) || pa == UINT32_MAX || (pa & (NC_PAGE - 1)) + n > NC_PAGE ||
         (uint64_t)pa + n > vm->ram_size) {
@@ -409,14 +395,14 @@ bool nc_ram_emulate(NcVm *vm, const siginfo_t *info, void *ucontext,
         if (a.bytes == 16) {
             if (a.store) {
                 stored(at, 16);
-                memcpy(m, &fp->vregs[rt], 16);
+                memcpy(m, &fp[rt], 16);
             } else {
-                memcpy(&fp->vregs[rt], m, 16);
+                memcpy(&fp[rt], m, 16);
             }
             continue;
         }
         if (a.store) {
-            const uint64_t v = a.fp ? (uint64_t)fp->vregs[rt] : rt == 31 ? 0 : mc->regs[rt];
+            const uint64_t v = a.fp ? (uint64_t)fp[rt] : rt == 31 ? 0 : mc->regs[rt];
             stored(at, a.bytes);
             memcpy(m, &v, a.bytes);     /* little-endian: the low bytes */
             continue;
@@ -424,7 +410,7 @@ bool nc_ram_emulate(NcVm *vm, const siginfo_t *info, void *ucontext,
         uint64_t v = 0;
         memcpy(&v, m, a.bytes);
         if (a.fp) {
-            fp->vregs[rt] = (__uint128_t)v; /* a scalar load clears the rest */
+            fp[rt] = (__uint128_t)v; /* a scalar load clears the rest */
         } else if (rt != 31) {
             uint64_t r = v;
             if (a.sign) {

@@ -25,7 +25,11 @@ extern "C" {
 
 #define NC_KERNEL_VA     0x80010000u
 #define NC_KERNEL_PA     0x00010000u
-#define NC_KERNEL_SIZE   0x00040000u
+/* What kernel.c lays out (to K_FAST_END), in whole 16 KiB host pages. The
+ * pages between it and Halo's fixed block at 0x61000 are the title's: its
+ * DirectSound takes 4 KiB pages under 16 MiB from them at a level's load,
+ * and with the kernel holding them it failed and Halo read a null table. */
+#define NC_KERNEL_SIZE   0x00014000u
 #define NC_KCALL_VECTOR  0x3Fu
 /* In the KPCR's page, past its fields (guest code reads it at fs:): 1 while
  * DPCs are queued (timer.c), for the guest-code KfLowerIrql (kernel.c). */

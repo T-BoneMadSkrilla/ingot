@@ -196,6 +196,31 @@ static void make_dirty(uint32_t pa)
  * another view faults once more and opens that one. */
 static void open_view(uint32_t pa, void *at)
 {
+#ifdef NC_VM16K
+    /* vm16k decides access from vm->vprot (a trapped host page's stores are
+     * emulated against it): a host mprotect leaves it denying the store,
+     * which faults back here forever. The host page's other guest pages open
+     * with it, their first writes counted as the guest's: a host page of
+     * mixed protections is trapped, every access to it emulated. */
+    const uintptr_t base = (uintptr_t)g_vm->base;
+    const uint32_t blk = (uint32_t)(((uintptr_t)at - base) & ~(uintptr_t)(16384 - 1));
+    for (uint32_t va = blk; va - blk < 16384; va += NC_PAGE) {
+        const uint32_t npa = nc_vm_phys(g_vm, va);
+        if (npa == UINT32_MAX || npa >= g_vm->ram_size || npa / NC_PAGE == pa / NC_PAGE ||
+            nc_vm_noaccess_has(g_vm, npa)) {
+            continue;
+        }
+        const uint8_t wp = __atomic_load_n(&g_vm->wp[npa / NC_PAGE], __ATOMIC_ACQUIRE);
+        if (wp == NC_WP_CLEAN) {
+            hle_mem_first_write(npa & ~(NC_PAGE - 1), 4);
+        }
+        if (wp) {
+            nc_vm_protect_page(g_vm, npa & ~(NC_PAGE - 1), false);
+        }
+    }
+    nc_vm_protect_page(g_vm, pa & ~(NC_PAGE - 1), false);
+    return;
+#endif
     void *page = (void *)((uintptr_t)at & ~(uintptr_t)(NC_PAGE - 1));
     if (mprotect(page, NC_PAGE, PROT_READ | PROT_WRITE)) {
         nc_vm_protect_page(g_vm, pa & ~(NC_PAGE - 1), false);   /* every view, as before */

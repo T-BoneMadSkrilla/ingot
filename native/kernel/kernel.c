@@ -1248,6 +1248,9 @@ static void kcall(NcKernel *k, NcFrame *f, unsigned ordinal)
     if (scoped) {
         nc_kernel_fault_scope(&env);
     }
+#ifdef NC_VM16K
+    nc_vm_regroup(k->vm);
+#endif
     k->in_call = true;
     const uint64_t t0 = nc_ke_now_ns();
     uint64_t r = k->impl[ordinal](k, f, args);
@@ -1262,7 +1265,18 @@ static void kcall(NcKernel *k, NcFrame *f, unsigned ordinal)
         const char *t = getenv("NC_TRACE_KCALL");
         g_trace_left = t && !getenv("NC_TRACE_KCALL_AT") ? atol(t) : 0;
     }
-    if (g_trace_left > 0) {
+    /* NC_TRACE_KCALL_SKIP="NameA,NameB": calls not traced (nor counted) */
+    static const char *skip;
+    static bool skip_read;
+    if (!skip_read) {
+        skip = getenv("NC_TRACE_KCALL_SKIP");
+        skip_read = true;
+    }
+    const char *hit = skip && g_trace_left > 0 ? strstr(skip, e->name) : NULL;
+    const size_t nl = strlen(e->name);
+    if (hit && (hit == skip || hit[-1] == ',') && (hit[nl] == ',' || !hit[nl])) {
+        /* skipped */
+    } else if (g_trace_left > 0) {
         g_trace_left--;
         char calls[96];
         nc_kernel_frame_chain(k, f, calls, sizeof(calls));
@@ -1664,6 +1678,9 @@ static bool sysop(void *opaque, NcFrame *f, enum NcSysOp op, unsigned size)
          * (the on-demand dump lists the busiest). */
         int_sample(eip);
         nc_frame_clear_interrupt(f);
+#ifdef NC_VM16K
+        nc_vm_regroup(k->vm); /* for a thread making no kernel calls */
+#endif
         nc_ke_update_time(k);
         clock_tick(k);
         break;

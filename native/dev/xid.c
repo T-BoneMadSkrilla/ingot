@@ -65,7 +65,7 @@ typedef struct ScriptStep {
     uint8_t sticks;     /* bit n: stick[n] (lx ly rx ry) set */
     int16_t stick[4];
 } ScriptStep;
-static ScriptStep g_script[64];
+static ScriptStep g_script[1024];
 static unsigned g_nscript;
 static uint64_t g_script_t0;
 
@@ -114,7 +114,7 @@ static void script_load(void)
     if (!s || g_nscript) {
         return;
     }
-    static char file[2048];
+    static char file[16384];
     if (*s == '@') {
         FILE *f = fopen(s + 1, "r");
         const size_t n = f ? fread(file, 1, sizeof(file) - 1, f) : 0;
@@ -278,14 +278,20 @@ static int xid_data(NcUsbDev *d, bool in, int ep, uint8_t *buf, int len)
         make_report(x->player, r);
         {   /* button changes as the title reads them (a few a second at most) */
             static uint16_t s_last[XID_PLAYERS];
+            static uint8_t s_last_an[XID_PLAYERS];
             static unsigned s_logged;
             const uint16_t b = (uint16_t)(r[2] | r[3] << 8);
-            if (b != s_last[x->player] && s_logged < 200) {
+            uint8_t an = 0;     /* bit n: analog button n (A B X Y black white LT RT) down */
+            for (unsigned i = 0; i < 8; i++) {
+                an |= (uint8_t)((r[4 + i] > 0x40) << i);
+            }
+            if ((b != s_last[x->player] || an != s_last_an[x->player]) && s_logged < 400) {
                 s_logged++;
-                nc_log("hakuX-native-usb", "gamepad %u: buttons %04x -> %04x (A %02x)", x->player,
-                       s_last[x->player], b, r[4]);
+                nc_log("hakuX-native-usb", "gamepad %u: buttons %04x -> %04x, analog %02x -> %02x",
+                       x->player, s_last[x->player], b, s_last_an[x->player], an);
             }
             s_last[x->player] = b;
+            s_last_an[x->player] = an;
         }
         const int n = MIN(len, 20);
         memcpy(buf, r, n);

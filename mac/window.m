@@ -1,0 +1,292 @@
+/*
+ * hakuX on macOS — the window: a Cocoa window whose view is a CAMetalLayer,
+ * handed to the HLE GPU's presenter as the ANativeWindow it draws into
+ * (mac/compat/include/android/native_window.h; hw/xbox/hle/vk/swapchain.c
+ * makes its Vulkan surface of the layer through MoltenVK). The main thread
+ * runs the window and presents, as the Android app's does
+ * (native/app/app_main.c); the core runs on a thread of its own.
+ *
+ * Player 1 is the first game controller (GameController framework) and the
+ * keyboard:
+ *   WASD left stick     arrows right stick    J A   K B   U X   I Y
+ *   H white   L black   Q left trigger        E right trigger
+ *   1 2 3 4 D-pad up, down, left, right       Return start   Backspace back
+ *   Z, C left and right stick click           Cmd-Q quits    Ctrl-Cmd-F full screen
+ *
+ * Ingot's launcher names the window (INGOT_TITLE, else the disc's file
+ * name), gives the app its icon (INGOT_ICON, a file), may start it full
+ * screen (INGOT_FULLSCREEN=1) and shapes it 16:9 (INGOT_WIDESCREEN=1).
+ */
+#import <Cocoa/Cocoa.h>
+#import <GameController/GameController.h>
+#import <QuartzCore/CAMetalLayer.h>
+
+#include "native/app/app.h"
+#include "native/dev/usb.h"
+#include "mac/window.h"
+
+#include <android/native_window.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static struct ANativeWindow g_nw;
+static bool g_keys[128];
+
+@interface NcView : NSView
+@end
+
+@implementation NcView
+- (BOOL)acceptsFirstResponder
+{
+    return YES;
+}
+- (void)keyDown:(NSEvent *)e
+{
+    if (e.modifierFlags & NSEventModifierFlagCommand) {
+        return; /* the menus' */
+    }
+    if (e.keyCode == 0x35) { /* Esc: out of full screen */
+        if (self.window.styleMask & NSWindowStyleMaskFullScreen) {
+            [self.window toggleFullScreen:nil];
+        }
+        return;
+    }
+    if (e.keyCode < 128) {
+        g_keys[e.keyCode] = true;
+    }
+}
+- (void)keyUp:(NSEvent *)e
+{
+    if (e.keyCode < 128) {
+        g_keys[e.keyCode] = false;
+    }
+}
+@end
+
+@interface NcDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@end
+
+@implementation NcDelegate
+- (void)windowWillClose:(NSNotification *)n
+{
+    _exit(0);
+}
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app
+{
+    _exit(0);
+}
+@end
+
+/* macOS virtual key codes (Carbon's kVK_*) */
+enum {
+    K_A = 0x00, K_S = 0x01, K_D = 0x02, K_H = 0x04, K_Z = 0x06, K_C = 0x08, K_Q = 0x0C, K_W = 0x0D,
+    K_E = 0x0E, K_1 = 0x12, K_2 = 0x13, K_3 = 0x14, K_4 = 0x15, K_U = 0x20, K_I = 0x22, K_RETURN = 0x24,
+    K_L = 0x25, K_J = 0x26, K_K = 0x28, K_DELETE = 0x33, K_LEFT = 0x7B, K_RIGHT = 0x7C, K_DOWN = 0x7D,
+    K_UP = 0x7E,
+};
+
+static int16_t axis(bool neg, bool pos)
+{
+    return (int16_t)((pos ? 32767 : 0) - (neg ? 32767 : 0));
+}
+
+static void read_keys(NcPadState *s)
+{
+    static const struct {
+        uint8_t key, analog;
+    } k_analog[] = {
+        {K_J, 0}, {K_K, 1}, {K_U, 2}, {K_I, 3}, {K_L, 4}, {K_H, 5}, {K_Q, 6}, {K_E, 7},
+    };
+    static const struct {
+        uint8_t key;
+        uint16_t bit;
+    } k_digital[] = {
+        {K_1, NC_PAD_DPAD_UP}, {K_2, NC_PAD_DPAD_DOWN}, {K_3, NC_PAD_DPAD_LEFT}, {K_4, NC_PAD_DPAD_RIGHT},
+        {K_RETURN, NC_PAD_START}, {K_DELETE, NC_PAD_BACK}, {K_Z, NC_PAD_LTHUMB}, {K_C, NC_PAD_RTHUMB},
+    };
+    for (unsigned i = 0; i < sizeof(k_analog) / sizeof(k_analog[0]); i++) {
+        if (g_keys[k_analog[i].key]) {
+            s->analog[k_analog[i].analog] = 0xFF;
+        }
+    }
+    for (unsigned i = 0; i < sizeof(k_digital) / sizeof(k_digital[0]); i++) {
+        if (g_keys[k_digital[i].key]) {
+            s->buttons |= k_digital[i].bit;
+        }
+    }
+    s->lx = axis(g_keys[K_A], g_keys[K_D]);
+    s->ly = axis(g_keys[K_S], g_keys[K_W]);
+    s->rx = axis(g_keys[K_LEFT], g_keys[K_RIGHT]);
+    s->ry = axis(g_keys[K_DOWN], g_keys[K_UP]);
+}
+
+static int16_t stick(float v)
+{
+    return (int16_t)(v < -1.0f ? -32767 : v > 1.0f ? 32767 : v * 32767.0f);
+}
+
+/* The Duke from a modern controller, as app_main.c's read_gamepad: the face
+ * buttons and black/white (the shoulder buttons) fully pressed or not; the
+ * stick pushed furthest wins over the keyboard's. */
+static void read_controller(NcPadState *s)
+{
+    GCExtendedGamepad *g = GCController.controllers.firstObject.extendedGamepad;
+    if (!g) {
+        return;
+    }
+    GCControllerButtonInput *analog[6] = {g.buttonA, g.buttonB, g.buttonX, g.buttonY, g.rightShoulder,
+                                          g.leftShoulder};
+    for (unsigned i = 0; i < 6; i++) {
+        if (analog[i].pressed) {
+            s->analog[i] = 0xFF;
+        }
+    }
+    const uint8_t lt = (uint8_t)(g.leftTrigger.value * 255.0f), rt = (uint8_t)(g.rightTrigger.value * 255.0f);
+    s->analog[6] = lt > s->analog[6] ? lt : s->analog[6];
+    s->analog[7] = rt > s->analog[7] ? rt : s->analog[7];
+    s->buttons |= (g.dpad.up.pressed ? NC_PAD_DPAD_UP : 0) | (g.dpad.down.pressed ? NC_PAD_DPAD_DOWN : 0) |
+                  (g.dpad.left.pressed ? NC_PAD_DPAD_LEFT : 0) | (g.dpad.right.pressed ? NC_PAD_DPAD_RIGHT : 0) |
+                  (g.buttonMenu.pressed ? NC_PAD_START : 0) | (g.buttonOptions.pressed ? NC_PAD_BACK : 0) |
+                  (g.leftThumbstickButton.pressed ? NC_PAD_LTHUMB : 0) |
+                  (g.rightThumbstickButton.pressed ? NC_PAD_RTHUMB : 0);
+    const int16_t lx = stick(g.leftThumbstick.xAxis.value), ly = stick(g.leftThumbstick.yAxis.value);
+    const int16_t rx = stick(g.rightThumbstick.xAxis.value), ry = stick(g.rightThumbstick.yAxis.value);
+    if (abs(lx) + abs(ly) > abs(s->lx) + abs(s->ly)) {
+        s->lx = lx;
+        s->ly = ly;
+    }
+    if (abs(rx) + abs(ry) > abs(s->rx) + abs(s->ry)) {
+        s->rx = rx;
+        s->ry = ry;
+    }
+}
+
+static int (*g_core)(void *);
+static void *g_core_arg;
+
+static void *core_thread(void *arg)
+{
+    _exit(g_core(g_core_arg));
+}
+
+static void add_menus(NSString *app_name)
+{
+    NSMenu *bar = [NSMenu new];
+    NSMenuItem *app_item = [NSMenuItem new];
+    [bar addItem:app_item];
+    NSMenu *app_menu = [NSMenu new];
+    [app_menu addItemWithTitle:[@"Hide " stringByAppendingString:app_name] action:@selector(hide:) keyEquivalent:@"h"];
+    [app_menu addItem:[NSMenuItem separatorItem]];
+    [app_menu addItemWithTitle:@"Quit Game" action:@selector(terminate:) keyEquivalent:@"q"];
+    app_item.submenu = app_menu;
+
+    NSMenuItem *window_item = [NSMenuItem new];
+    [bar addItem:window_item];
+    NSMenu *window_menu = [[NSMenu alloc] initWithTitle:@"Window"];
+    NSMenuItem *full = [window_menu addItemWithTitle:@"Toggle Full Screen"
+                                              action:@selector(toggleFullScreen:)
+                                       keyEquivalent:@"f"];
+    full.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
+    [window_menu addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+    window_item.submenu = window_menu;
+    NSApp.mainMenu = bar;
+}
+
+void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
+{
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        NcDelegate *delegate = [NcDelegate new];
+        NSApp.delegate = delegate;
+        const char *icon = getenv("INGOT_ICON");
+        if (icon) {
+            NSImage *image = [[NSImage alloc] initWithContentsOfFile:[NSString stringWithUTF8String:icon]];
+            if (image) {
+                NSApp.applicationIconImage = image;
+            }
+        }
+        if (getenv("INGOT_TITLE")) {
+            title = getenv("INGOT_TITLE");
+        }
+        add_menus(NSProcessInfo.processInfo.processName);
+        [NSApp finishLaunching];
+
+        NSWindow *w = [[NSWindow alloc]
+            initWithContentRect:NSMakeRect(0, 0, 1280, 960)
+                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                        backing:NSBackingStoreBuffered
+                          defer:NO];
+        w.delegate = delegate;
+        w.title = [NSString stringWithUTF8String:title];
+        const bool wide = getenv("INGOT_WIDESCREEN") && atoi(getenv("INGOT_WIDESCREEN"));
+        w.contentAspectRatio = wide ? NSMakeSize(16, 9) : NSMakeSize(4, 3);
+        if (wide) {
+            [w setContentSize:NSMakeSize(1280, 720)];
+        }
+        w.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
+        w.backgroundColor = NSColor.blackColor;
+        NcView *view = [[NcView alloc] initWithFrame:w.contentLayoutRect];
+        CAMetalLayer *layer = [CAMetalLayer layer];
+        view.layer = layer;
+        view.wantsLayer = YES;
+        w.contentView = view;
+        [w makeFirstResponder:view];
+        [w center];
+        [w makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+        if (getenv("INGOT_FULLSCREEN") && atoi(getenv("INGOT_FULLSCREEN"))) {
+            [w toggleFullScreen:nil];
+        }
+        g_nw.layer = (__bridge const void *)layer;
+
+        g_core = core;
+        g_core_arg = arg;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 16u << 20);
+        pthread_t t;
+        pthread_create(&t, &attr, core_thread, NULL);
+        pthread_attr_destroy(&attr);
+
+        uint64_t n = 0;
+        for (;;) {
+            @autoreleasepool {
+                NSEvent *e;
+                while ((e = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                               untilDate:nil
+                                                  inMode:NSDefaultRunLoopMode
+                                                 dequeue:YES])) {
+                    [NSApp sendEvent:e];
+                }
+                const CGFloat scale = w.backingScaleFactor;
+                const CGSize size = view.bounds.size;
+                layer.contentsScale = scale;
+                const CGSize px = CGSizeMake(size.width * scale, size.height * scale);
+                if (!CGSizeEqualToSize(layer.drawableSize, px)) {
+                    layer.drawableSize = px;
+                }
+                g_nw.width = (int32_t)px.width;
+                g_nw.height = (int32_t)px.height;
+
+                NcPadState s = {0};
+                if (w.isKeyWindow) {
+                    read_keys(&s);
+                }
+                read_controller(&s);
+                nc_pad_set(0, &s);
+
+                if (!nc_present_frame(&g_nw)) {
+                    usleep(8000);
+                }
+                if (++n % 30 == 0) {
+                    float fps, avg, last;
+                    nc_present_stats(&fps, &avg, &last);
+                    w.title = [NSString stringWithFormat:@"%s — %.0f fps", title, fps];
+                }
+            }
+        }
+    }
+}

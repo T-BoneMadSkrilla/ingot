@@ -520,15 +520,21 @@ static void section_release(NcKernel *k, uint32_t s, uint32_t va, uint32_t vsize
 {
     const uint32_t base = k->xbe_base, hdr_end = base + nc_vm_rd32(k->vm, base + 0x108);
     const uint32_t nsec = nc_vm_rd32(k->vm, base + 0x11C), secs = nc_vm_rd32(k->vm, base + 0x120);
+#ifdef NC_VM16K
+    const uint32_t unit = nc_vm16k_plain() ? NC_PAGE : 16384u; /* the host page: one shared keeps it whole (nc_xbe_back) */
+#else
+    const uint32_t unit = NC_PAGE;
+#endif
     for (uint64_t p = va & ~(NC_PAGE - 1); p < (uint64_t)va + vsize; p += NC_PAGE) {
-        bool shared = p < hdr_end;
+        const uint64_t u = p & ~(uint64_t)(unit - 1);
+        bool shared = u < hdr_end;
         for (uint32_t i = 0; i < nsec && !shared; i++) {
             const uint32_t o = secs + i * 0x38;
             if (o == s || !nc_vm_rd32(k->vm, o + 0x18)) {
                 continue;
             }
             const uint32_t ova = nc_vm_rd32(k->vm, o + 0x04), osize = nc_vm_rd32(k->vm, o + 0x08);
-            shared = ova < p + NC_PAGE && (uint64_t)ova + osize > p;
+            shared = ova < u + unit && (uint64_t)ova + osize > u;
         }
         const uint32_t pa = nc_vm_phys(k->vm, (uint32_t)p);
         if (!shared && pa != UINT32_MAX) {
