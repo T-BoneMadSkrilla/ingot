@@ -76,6 +76,7 @@ int hle_mtl_init(void)
         return -1;
     }
     g_mtl.queue = [g_mtl.dev newCommandQueueWithMaxCommandBufferCount:64];
+    g_mtl.present_queue = [g_mtl.dev newCommandQueue];
     g_mtl.bc = g_mtl.dev.supportsBCTextureCompression;
     NSError *err = nil;
     MTLCompileOptions *co = [MTLCompileOptions new];

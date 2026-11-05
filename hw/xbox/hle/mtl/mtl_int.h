@@ -18,6 +18,7 @@
 typedef struct HleMtl {
     id<MTLDevice> dev;
     id<MTLCommandQueue> queue;
+    id<MTLCommandQueue> present_queue; /* the window's presents, not behind the game's work */
     id<MTLSharedEvent> tl;          /* the render timeline (timeline.m) */
     id<MTLBuffer> arena;            /* the upload arena (§5.3), shared */
     id<MTLBuffer> land;             /* readbacks the CPU reads, shared */

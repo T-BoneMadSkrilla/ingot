@@ -17,6 +17,7 @@ static struct {
     id<CAMetalDrawable> drawable;
     uint32_t w, h;
     bool have;                  /* frame holds a slot */
+    int stale;                  /* a slot an in-flight present may still read, or -1 */
     HleDispFrame frame;
     id<MTLTexture> frame_tex;   /* frame.tex, kept alive */
     uint8_t rgb[3][256];
@@ -27,7 +28,7 @@ static struct {
     uint32_t last_gen, last_swap, last_gamma, last_w, last_h;
     uint64_t last_key;
     bool shown;
-} g_pr = { .identity = true };
+} g_pr = { .identity = true, .stale = -1 };
 
 bool hle_present_unchanged(struct ANativeWindow *win, uint64_t key)
 {
@@ -72,7 +73,10 @@ bool hle_present_frame(uint32_t *w, uint32_t *h)
     HleDispFrame f;
     if (hle_disp_acquire(&f)) {
         if (g_pr.have && g_pr.frame.slot != f.slot) {
-            hle_disp_release(g_pr.frame.slot);
+            if (g_pr.stale >= 0) {
+                hle_disp_release(g_pr.stale);
+            }
+            g_pr.stale = g_pr.frame.slot;
         }
         g_pr.frame = f;
         g_pr.frame_tex = f.tex;
@@ -104,7 +108,13 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
     hle_disp_use_begin();
-    id<MTLCommandBuffer> cb = [g_mtl.queue commandBuffer];
+    /* Its own queue, so a present doesn't wait out the game's queued work;
+     * the GPU waits for the frame's render instead (it can still be pending
+     * when it goes to the front). */
+    id<MTLCommandBuffer> cb = [g_mtl.present_queue commandBuffer];
+    if (g_pr.have && g_pr.frame.value) {
+        [cb encodeWaitForEvent:g_mtl.tl value:g_pr.frame.value];
+    }
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     id<MTLRenderPipelineState> p = g_pr.have ?
         hle_mtl_pipe(@"hle_tri", gamma ? @"hle_present" : @"hle_copy", MTLPixelFormatBGRA8Unorm,
@@ -123,6 +133,16 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
     }
     [e endEncoding];
     [cb presentDrawable:g_pr.drawable];
+    /* The replaced frame's slot goes back once the presents before this one,
+     * the last to read it, are done (the queue runs in order). */
+    if (g_pr.stale >= 0) {
+        const int stale = g_pr.stale;
+        g_pr.stale = -1;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)done;
+            hle_disp_release(stale);
+        }];
+    }
     [cb commit];
     hle_disp_use_end();
     g_pr.drawable = nil;
