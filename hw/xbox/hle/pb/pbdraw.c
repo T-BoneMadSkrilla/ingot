@@ -627,24 +627,73 @@ static void restored_pixels(PbObj *o)
     }
 }
 
-/* The slot a new object takes once all are used: the one bound longest ago
- * (never bound first), and never one still in use: the bound targets, the
- * one shown, a cube or its faces (views into it), a z-read's source, the
- * one just made (a bind makes its colour target, then its depth one).
- * NULL if every one is. */
-static PbObj *evict_slot(void)
+static bool obj_busy(const PbObj *o)
 {
-    PbObj *best = NULL;
+    bool busy = o->id == g_pd.rt || o->id == g_pd.ds || o->id == g_pd.shown_id || o->id == g_pd.made;
+    for (unsigned j = 0; j < g_pd.nzr && !busy; j++) {
+        busy = g_pd.zr[j].src == o->id;
+    }
+    return busy;
+}
+
+/* A cube's faces' targets made targets of their own again (images of their
+ * own, empty), the cube's slot then the caller's to take: Forza makes a
+ * reflection cube in new memory every race, each pinning seven objects, and
+ * the table filled in a few races; the next race's cube was never made and
+ * its cars sampled face 0 as a 2D texture (white roofs and glass). */
+static void cube_retire(PbObj *c)
+{
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
         PbObj *o = &g_pd.objs[i];
-        bool busy = o->id == g_pd.rt || o->id == g_pd.ds || o->id == g_pd.shown_id ||
-                    o->id == g_pd.made || o->cube || o->d.parent;
-        for (unsigned j = 0; j < g_pd.nzr && !busy; j++) {
-            busy = g_pd.zr[j].src == o->id;
+        if (o->d.parent != c->id) {
+            continue;
         }
-        if (!busy && (!best || o->bound < best->bound)) {
+        HleCmdObjDestroy *x = begin(HLE_OP_OBJ_DESTROY, sizeof(*x));
+        x->after = 0;
+        x->id = o->id;
+        hle_fe_commit();
+        o->id = g_pd.next_id++;
+        o->d.id = o->id;
+        o->d.parent = 0;
+        o->d.face = 0;
+        HleCmdObj *v = begin(HLE_OP_OBJ_CREATE, sizeof(*v));
+        v->s = o->d;
+        hle_fe_commit();
+    }
+}
+
+/* The slot a new object takes once all are used: the one bound longest ago
+ * (never bound first), and never one still in use: the bound targets, the
+ * one shown, a z-read's source, the one just made (a bind makes its colour
+ * target, then its depth one), any in [spare, spare + spare_len) (a cube's
+ * faces being made). A cube and its faces (views into it) go together, as
+ * the face bound last was bound, none of them in use (cube_retire). NULL if
+ * every one is. */
+static PbObj *evict_slot(uint32_t spare, uint32_t spare_len)
+{
+    PbObj *best = NULL;
+    uint64_t best_bound = 0;
+    for (unsigned i = 0; i < g_pd.nobjs; i++) {
+        PbObj *o = &g_pd.objs[i];
+        if (o->d.parent || (spare_len && o->d.pa - spare < spare_len)) {
+            continue;
+        }
+        bool busy = obj_busy(o);
+        uint64_t bound = o->bound;
+        for (unsigned j = 0; o->cube && j < g_pd.nobjs && !busy; j++) {
+            const PbObj *f = &g_pd.objs[j];
+            if (f->d.parent == o->id) {
+                busy = obj_busy(f);
+                bound = MAX(bound, f->bound);
+            }
+        }
+        if (!busy && (!best || bound < best_bound)) {
             best = o;
+            best_bound = bound;
         }
+    }
+    if (best && best->cube) {
+        cube_retire(best);
     }
     return best;
 }
@@ -684,7 +733,7 @@ static uint32_t object(uint32_t pa, uint32_t xfmt, uint32_t pitch, uint32_t w, u
     if (g_pd.nobjs < MAX_OBJS) {
         o = &g_pd.objs[g_pd.nobjs++];
     } else {
-        o = evict_slot();
+        o = evict_slot(0, 0);
         if (!o) {
             static unsigned s_full;
             if (s_full++ < 8) {
@@ -2095,11 +2144,24 @@ static uint32_t cube_of_targets(uint32_t pa, uint32_t code, uint32_t w, uint32_t
                 xfmt = g_pd.objs[i].d.xfmt;
             }
         }
-        if (!found || g_pd.nobjs >= MAX_OBJS) {
+        if (!found) {
             return 0;
         }
     }
-    PbObj *c = &g_pd.objs[g_pd.nobjs++];
+    PbObj *c;
+    if (g_pd.nobjs < MAX_OBJS) {
+        c = &g_pd.objs[g_pd.nobjs++];
+    } else {
+        c = evict_slot(pa, 6 * stride);
+        if (!c) {
+            return 0;
+        }
+        coh_forget(c);
+        HleCmdObjDestroy *x = begin(HLE_OP_OBJ_DESTROY, sizeof(*x));
+        x->after = 0;
+        x->id = c->id;
+        hle_fe_commit();
+    }
     memset(c, 0, sizeof(*c));
     c->id = g_pd.next_id++;
     c->cube = true;
