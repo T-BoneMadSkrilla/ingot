@@ -6,7 +6,8 @@
  * Input comes from nc_pad_set, and for headless runs from NC_PAD_SCRIPT:
  * "ms:input[+input...]:hold_ms,..." (inputs: a b x y black white lt rt up
  * down left right start back ls rs, or a stick's position lx= ly= rx= ry=
- * -32767..32767), times from the first report; "60f:a:2" counts frames
+ * -32767..32767, or p2..p4 for that player's controller instead of player
+ * 1's), times from the first report; "60f:a:2" counts frames
  * instead (frame 60, held for 2: the HLE GPU's swaps in this process, after
  * a savestate's load the frames since it), the same each run. "@path" reads
  * it from a file (debug.hakux.env holds 91 characters).
@@ -63,6 +64,7 @@ typedef struct ScriptStep {
     uint16_t buttons;
     uint8_t analog;     /* bit n: analog[n] fully pressed */
     uint8_t sticks;     /* bit n: stick[n] (lx ly rx ry) set */
+    uint8_t player;
     int16_t stick[4];
 } ScriptStep;
 static ScriptStep g_script[1024];
@@ -95,6 +97,10 @@ static bool script_button(const char *name, size_t n, ScriptStep *st)
             st->analog |= k_names[i].analog;
             return true;
         }
+    }
+    if (n == 2 && name[0] == 'p' && name[1] >= '1' && name[1] <= '4') {
+        st->player = (uint8_t)(name[1] - '1');
+        return true;
     }
     static const char k_sticks[4][3] = {"lx", "ly", "rx", "ry"};
     for (unsigned i = 0; i < 4; i++) {
@@ -164,7 +170,7 @@ static void make_report(unsigned player, uint8_t r[20])
     p = g_pad[player];
     pthread_mutex_unlock(&g_lock);
 
-    if (player == 0 && g_nscript) {
+    if (g_nscript) {
         if (!g_script_t0) {
             g_script_t0 = now_ms();
         }
@@ -172,7 +178,7 @@ static void make_report(unsigned player, uint8_t r[20])
         for (unsigned i = 0; i < g_nscript; i++) {
             const ScriptStep *st = &g_script[i];
             const uint64_t t = st->frames ? frame : ms;
-            if (t >= st->at && t < (uint64_t)st->at + st->hold) {
+            if (st->player == player && t >= st->at && t < (uint64_t)st->at + st->hold) {
                 p.buttons |= st->buttons;
                 for (unsigned b = 0; b < 8; b++) {
                     if (st->analog & (1u << b)) {

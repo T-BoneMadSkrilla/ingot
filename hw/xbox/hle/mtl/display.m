@@ -258,12 +258,16 @@ bool hle_disp_acquire(HleDispFrame *f)
 uint8_t *hle_disp_read_front(uint32_t *w, uint32_t *h)
 {
     HleDispFrame f;
-    if (!hle_mtl_ready() || !hle_disp_acquire(&f)) {
+    if (!hle_mtl_ready()) {
+        return NULL;
+    }
+    hle_disp_use_begin();               /* f.tex isn't retained: a resize frees it */
+    if (!hle_disp_acquire(&f)) {
+        hle_disp_use_end();
         return NULL;
     }
     uint8_t *out = NULL;
     @autoreleasepool {
-        hle_disp_use_begin();
         const NSUInteger row = (NSUInteger)f.w * 4, size = row * f.h;
         id<MTLBuffer> buf = [g_mtl.dev newBufferWithLength:size options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [g_mtl.queue commandBuffer];

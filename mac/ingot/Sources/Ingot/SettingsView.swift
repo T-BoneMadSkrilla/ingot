@@ -115,7 +115,7 @@ struct ControlsSettings: View {
     var body: some View {
         Form {
             Section("Controller") {
-                Text("Player 1 is the first connected game controller (Xbox, PlayStation, or any MFi controller). Its shoulder buttons are White and Black.")
+                Text("Up to four controllers (Xbox, PlayStation, or any MFi controller) can play at once. Each one becomes the next free player as it connects, and its player light shows which. To change a controller's player while a game is running, use the Controllers menu in the menu bar. The shoulder buttons are White and Black.")
                     .foregroundStyle(.secondary)
             }
             Section("Keyboard") {

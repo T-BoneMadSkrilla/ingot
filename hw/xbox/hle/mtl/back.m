@@ -285,6 +285,11 @@ static void clear_drawn(const HleCmdClear *c, HleMtlSurf *rt, HleMtlSurf *ds, ui
     [e setRenderPipelineState:p];
     [e setDepthStencilState:clear_dss(flags & HLE_CLEAR_ZBUFFER, flags & HLE_CLEAR_STENCIL)];
     [e setStencilReferenceValue:c->stencil & 0xFF];
+    /* the encoder keeps the last draw's raster state: its culling dropped
+     * the triangle (Halo's second split-screen view, never cleared) */
+    [e setCullMode:MTLCullModeNone];
+    [e setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+    [e setDepthClipMode:MTLDepthClipModeClip];
     [e setVertexBytes:col length:16 atIndex:0];
     [e setVertexBytes:&z length:4 atIndex:1];
     [e setFragmentBytes:col length:16 atIndex:0];

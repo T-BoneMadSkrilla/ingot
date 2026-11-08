@@ -71,7 +71,14 @@ bool hle_present_begin(struct ANativeWindow *win, uint32_t *w, uint32_t *h)
 bool hle_present_frame(uint32_t *w, uint32_t *h)
 {
     HleDispFrame f;
-    if (hle_disp_acquire(&f)) {
+    /* f.tex isn't retained: a resize (hle_disp_init, under use) frees it */
+    hle_disp_use_begin();
+    const bool got = hle_disp_acquire(&f);
+    if (got) {
+        g_pr.frame_tex = f.tex;
+    }
+    hle_disp_use_end();
+    if (got) {
         if (g_pr.have && g_pr.frame.slot != f.slot) {
             if (g_pr.stale >= 0) {
                 hle_disp_release(g_pr.stale);
@@ -79,7 +86,6 @@ bool hle_present_frame(uint32_t *w, uint32_t *h)
             g_pr.stale = g_pr.frame.slot;
         }
         g_pr.frame = f;
-        g_pr.frame_tex = f.tex;
         g_pr.have = true;
     }
     if (!g_pr.have) {

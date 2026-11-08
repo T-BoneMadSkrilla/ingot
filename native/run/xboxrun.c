@@ -114,6 +114,12 @@ static void report_host_thread(uintptr_t pc, uintptr_t sp, uintptr_t addr)
         }
         fclose(f);
     }
+#ifdef __APPLE__
+    pthread_getname_np(pthread_self(), comm, sizeof(comm));
+    if (!comm[0]) {
+        snprintf(comm, sizeof(comm), "%s", pthread_main_np() ? "main" : "?");
+    }
+#endif
     int n = snprintf(buf, sizeof(buf), "hakuX-native-frontier:   thread %d (%s) sp=%llx (main %d)\n", tid, comm,
                      (unsigned long long)sp, (int)getpid());
     write(2, buf, (size_t)n);
@@ -138,6 +144,38 @@ static void report_host_thread(uintptr_t pc, uintptr_t sp, uintptr_t addr)
     fclose(f);
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* The host callers, by the frame pointer chain from the fault (lr first). */
+static void report_host_frames(uintptr_t lr, uintptr_t fp)
+{
+    char buf[512];
+    for (int i = 0; i < 24 && lr; i++) {
+        Dl_info dl;
+        const uintptr_t pc = lr & 0x0000FFFFFFFFFFFFull;    /* without the pointer's signature */
+        int n;
+        if (dladdr((void *)pc, &dl) && dl.dli_fbase) {
+            const char *base = strrchr(dl.dli_fname, '/');
+            n = snprintf(buf, sizeof(buf), "hakuX-native-frontier:   #%d %s+0x%llx (%s+0x%llx)\n", i,
+                         base ? base + 1 : dl.dli_fname, (unsigned long long)(pc - (uintptr_t)dl.dli_fbase),
+                         dl.dli_sname ? dl.dli_sname : "?",
+                         (unsigned long long)(dl.dli_saddr ? pc - (uintptr_t)dl.dli_saddr : 0));
+        } else {
+            n = snprintf(buf, sizeof(buf), "hakuX-native-frontier:   #%d %llx\n", i, (unsigned long long)pc);
+        }
+        write(2, buf, (size_t)n);
+        if (!fp || (fp & 15)) {
+            break;
+        }
+        const uintptr_t next = ((const uintptr_t *)fp)[0];
+        lr = ((const uintptr_t *)fp)[1];
+        if (next <= fp) {
+            break;
+        }
+        fp = next;
+    }
+}
+#endif
+
 static void fault(int sig, siginfo_t *info, void *ctx)
 {
     if (nc_core_fault(&g_core, sig, info, ctx)) {
@@ -159,9 +197,11 @@ static void fault(int sig, siginfo_t *info, void *ctx)
         n = snprintf(buf, sizeof(buf), "hakuX-native-frontier:   host insn %08x\n", *(const uint32_t *)(uintptr_t)mc->pc);
         write(2, buf, (size_t)n);
     }
-    /* Host code: where in which image (llvm-addr2line on the unstripped build). */
+    /* Host code: where in which image (llvm-addr2line on the unstripped build).
+     * Any pc in an image, eip or not: another thread's guest eip can come
+     * back for a crash in the system's code. */
     Dl_info dl;
-    if (!eip && dladdr((void *)(uintptr_t)mc->pc, &dl) && dl.dli_fbase) {
+    if (dladdr((void *)(uintptr_t)mc->pc, &dl) && dl.dli_fbase) {
         n = snprintf(buf, sizeof(buf), "hakuX-native-frontier:   host %s+0x%llx (%s)\n", dl.dli_fname,
                      (unsigned long long)((uintptr_t)mc->pc - (uintptr_t)dl.dli_fbase),
                      dl.dli_sname ? dl.dli_sname : "?");
@@ -169,6 +209,9 @@ static void fault(int sig, siginfo_t *info, void *ctx)
         n = snprintf(buf, sizeof(buf), "hakuX-native-frontier:   host lr +0x%llx\n",
                      (unsigned long long)((uintptr_t)mc->regs[30] - (uintptr_t)dl.dli_fbase));
         write(2, buf, (size_t)n);
+#if defined(__APPLE__) && defined(__aarch64__)
+        report_host_frames((uintptr_t)mc->regs[30], (uintptr_t)mc->regs[29]);
+#endif
     }
     if (g_core.kernel.in_call && g_core.kernel.frame) {
         /* Inside a kernel function: the guest state is the call's frame. */

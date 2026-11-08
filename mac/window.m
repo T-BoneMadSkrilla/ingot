@@ -6,8 +6,10 @@
  * runs the window and presents, as the Android app's does
  * (native/app/app_main.c); the core runs on a thread of its own.
  *
- * Player 1 is the first game controller (GameController framework) and the
- * keyboard:
+ * Each game controller (GameController framework) takes the lowest free
+ * player of 1-4 as it connects and keeps it until it disconnects, or until
+ * the Controllers menu gives it another; the console sees those players'
+ * controllers plugged in, and player 1's always, for the keyboard:
  *   WASD left stick     arrows right stick    J A   K B   U X   I Y
  *   H white   L black   Q left trigger        E right trigger
  *   1 2 3 4 D-pad up, down, left, right       Return start   Backspace back
@@ -23,6 +25,7 @@
 
 #include "native/app/app.h"
 #include "native/dev/usb.h"
+#include "native/state/save.h"
 #include "mac/window.h"
 
 #include <android/native_window.h>
@@ -64,10 +67,94 @@ static bool g_keys[128];
 }
 @end
 
-@interface NcDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+static GCController *g_player[4];
+static NSString *g_note;                /* shown in the title until g_note_until */
+static CFTimeInterval g_note_until;
+
+static void put_player(GCController *c, unsigned p)
+{
+    g_player[p] = c;
+    if (c) {
+        c.playerIndex = (GCControllerPlayerIndex)(GCControllerPlayerIndex1 + p);
+    }
+}
+
+@interface NcDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate>
 @end
 
 @implementation NcDelegate
+/* Save State: the running game to ~/Library/Application Support/Ingot/States/
+ * (the folder also holds the states' shared blobs), off the main thread;
+ * the window's title says how it went. */
+- (void)saveState:(id)sender
+{
+    NSString *title = NSApp.windows.firstObject.title ?: @"game";
+    NSString *name = [[title componentsSeparatedByString:@" — "].firstObject
+        stringByReplacingOccurrencesOfString:@"/"
+                                  withString:@"-"];
+    NSURL *dir = [[NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory
+                                                       inDomains:NSUserDomainMask].firstObject
+        URLByAppendingPathComponent:@"Ingot/States"
+                        isDirectory:YES];
+    [NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *path = [dir URLByAppendingPathComponent:[name stringByAppendingPathExtension:@"hxs"]].path;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        const char *err = nc_state_save(path.fileSystemRepresentation);
+        NSLog(@"Save State: %@: %s", path, err ? err : "saved");
+        NSString *note = err ? [NSString stringWithFormat:@"couldn't save state: %s", err] : @"state saved";
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_note = note;
+            g_note_until = CACurrentMediaTime() + 4.0;
+        });
+    });
+}
+/* The Controllers menu: each controller's player, chosen there; taking a
+ * player another controller has swaps the two. */
+- (void)menuNeedsUpdate:(NSMenu *)menu
+{
+    [menu removeAllItems];
+    unsigned n = 0;
+    for (unsigned p = 0; p < 4; p++) {
+        GCController *c = g_player[p];
+        if (!c) {
+            continue;
+        }
+        NSString *name = c.vendorName ?: @"Controller";
+        NSMenuItem *item = [menu addItemWithTitle:[NSString stringWithFormat:@"%@ (Player %u)", name, p + 1]
+                                           action:nil
+                                    keyEquivalent:@""];
+        NSMenu *sub = [NSMenu new];
+        for (unsigned q = 0; q < 4; q++) {
+            NSMenuItem *pick = [sub addItemWithTitle:[NSString stringWithFormat:@"Player %u", q + 1]
+                                              action:@selector(pickPlayer:)
+                                       keyEquivalent:@""];
+            pick.target = self;
+            pick.tag = q;
+            pick.representedObject = c;
+            pick.state = q == p ? NSControlStateValueOn : NSControlStateValueOff;
+        }
+        item.submenu = sub;
+        n++;
+    }
+    if (!n) {
+        [menu addItemWithTitle:@"No Controllers Connected" action:nil keyEquivalent:@""].enabled = NO;
+    }
+    [menu addItem:[NSMenuItem separatorItem]];
+    [menu addItemWithTitle:@"The keyboard is always Player 1" action:nil keyEquivalent:@""].enabled = NO;
+}
+- (void)pickPlayer:(NSMenuItem *)item
+{
+    GCController *c = item.representedObject;
+    const unsigned to = (unsigned)item.tag;
+    for (unsigned p = 0; p < 4; p++) {
+        if (g_player[p] == c && p != to) {
+            GCController *other = g_player[to];
+            put_player(c, to);
+            put_player(other, p);
+            return;
+        }
+    }
+}
 - (void)windowWillClose:(NSNotification *)n
 {
     _exit(0);
@@ -129,9 +216,8 @@ static int16_t stick(float v)
 /* The Duke from a modern controller, as app_main.c's read_gamepad: the face
  * buttons and black/white (the shoulder buttons) fully pressed or not; the
  * stick pushed furthest wins over the keyboard's. */
-static void read_controller(NcPadState *s)
+static void read_controller(GCExtendedGamepad *g, NcPadState *s)
 {
-    GCExtendedGamepad *g = GCController.controllers.firstObject.extendedGamepad;
     if (!g) {
         return;
     }
@@ -162,6 +248,45 @@ static void read_controller(NcPadState *s)
     }
 }
 
+/* Gives the controllers that came their players and frees the players of
+ * those that went; the console's controllers follow. */
+static void assign_players(void)
+{
+    static int s_mask = -1;
+    NSArray<GCController *> *now = GCController.controllers;
+    for (unsigned p = 0; p < 4; p++) {
+        if (g_player[p] && ![now containsObject:g_player[p]]) {
+            g_player[p] = nil;
+        }
+    }
+    for (GCController *c in now) {
+        if (!c.extendedGamepad) {
+            continue;
+        }
+        unsigned p = 0;
+        while (p < 4 && g_player[p] != c) {
+            p++;
+        }
+        if (p < 4) {
+            continue;
+        }
+        for (p = 0; p < 4 && g_player[p]; p++) {
+        }
+        if (p == 4) {
+            break;
+        }
+        put_player(c, p);
+    }
+    int mask = 1;
+    for (unsigned p = 0; p < 4; p++) {
+        mask |= g_player[p] ? 1 << p : 0;
+    }
+    if (mask != s_mask) {
+        nc_dev_ohci_set_pads((unsigned)mask);
+        s_mask = mask;
+    }
+}
+
 static int (*g_core)(void *);
 static void *g_core_arg;
 
@@ -170,13 +295,15 @@ static void *core_thread(void *arg)
     _exit(g_core(g_core_arg));
 }
 
-static void add_menus(NSString *app_name)
+static void add_menus(NSString *app_name, NcDelegate *delegate)
 {
     NSMenu *bar = [NSMenu new];
     NSMenuItem *app_item = [NSMenuItem new];
     [bar addItem:app_item];
     NSMenu *app_menu = [NSMenu new];
     [app_menu addItemWithTitle:[@"Hide " stringByAppendingString:app_name] action:@selector(hide:) keyEquivalent:@"h"];
+    [app_menu addItem:[NSMenuItem separatorItem]];
+    [app_menu addItemWithTitle:@"Save State" action:@selector(saveState:) keyEquivalent:@"s"].target = delegate;
     [app_menu addItem:[NSMenuItem separatorItem]];
     [app_menu addItemWithTitle:@"Quit Game" action:@selector(terminate:) keyEquivalent:@"q"];
     app_item.submenu = app_menu;
@@ -190,6 +317,12 @@ static void add_menus(NSString *app_name)
     full.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
     [window_menu addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
     window_item.submenu = window_menu;
+
+    NSMenuItem *pads_item = [NSMenuItem new];
+    [bar addItem:pads_item];
+    NSMenu *pads_menu = [[NSMenu alloc] initWithTitle:@"Controllers"];
+    pads_menu.delegate = delegate;
+    pads_item.submenu = pads_menu;
     NSApp.mainMenu = bar;
 }
 
@@ -210,7 +343,7 @@ void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
         if (getenv("INGOT_TITLE")) {
             title = getenv("INGOT_TITLE");
         }
-        add_menus(NSProcessInfo.processInfo.processName);
+        add_menus(NSProcessInfo.processInfo.processName, delegate);
         [NSApp finishLaunching];
 
         NSWindow *w = [[NSWindow alloc]
@@ -271,12 +404,15 @@ void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
                 g_nw.width = (int32_t)px.width;
                 g_nw.height = (int32_t)px.height;
 
-                NcPadState s = {0};
-                if (w.isKeyWindow) {
-                    read_keys(&s);
+                assign_players();
+                for (unsigned p = 0; p < 4; p++) {
+                    NcPadState s = {0};
+                    if (p == 0 && w.isKeyWindow) {
+                        read_keys(&s);
+                    }
+                    read_controller(g_player[p].extendedGamepad, &s);
+                    nc_pad_set(p, &s);
                 }
-                read_controller(&s);
-                nc_pad_set(0, &s);
 
                 if (!nc_present_frame(&g_nw)) {
                     usleep(8000);
@@ -284,7 +420,9 @@ void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
                 if (++n % 30 == 0) {
                     float fps, avg, last;
                     nc_present_stats(&fps, &avg, &last);
-                    w.title = [NSString stringWithFormat:@"%s — %.0f fps", title, fps];
+                    w.title = CACurrentMediaTime() < g_note_until
+                                  ? [NSString stringWithFormat:@"%s — %@", title, g_note]
+                                  : [NSString stringWithFormat:@"%s — %.0f fps", title, fps];
                 }
             }
         }

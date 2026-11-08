@@ -891,6 +891,36 @@ static bool disc_read_later(NcKernel *k, const NcFile *nf, const uint32_t *a, co
     return queued;
 }
 
+/* A read whose guest view of the buffer has a page without access (vm16k
+ * traps a 16K host page whose 4K guest pages aren't in physical order):
+ * read aside, then written a guest page at a time through the RAM view, the
+ * write reported as the overlapped reads' are. */
+static bool read_through_ram(NcKernel *k, const NcFile *nf, uint64_t off, uint32_t va, uint32_t len)
+{
+    uint8_t *buf = malloc(len);
+    if (!buf) {
+        return false;
+    }
+    bool ok = nf->kind == F_DISC ? nc_disc_read_file(k->disc, &nf->disc, off, buf, len)
+                                 : pread(nf->fd, buf, len, (off_t)off) == (ssize_t)len;
+    for (uint32_t done = 0; ok && done < len;) {
+        const uint32_t room = NC_PAGE - ((va + done) & (NC_PAGE - 1));
+        const uint32_t chunk = len - done < room ? len - done : room;
+        const uint32_t pa = nc_vm_phys(k->vm, va + done);
+        if (pa == UINT32_MAX || (uint64_t)pa + chunk > k->vm->ram_size) {
+            ok = false;
+            break;
+        }
+        memcpy(k->vm->phys + pa, buf + done, chunk);
+        if (nc_vm_dma.wrote) {
+            nc_vm_dma.wrote(pa, chunk);
+        }
+        done += chunk;
+    }
+    free(buf);
+    return ok;
+}
+
 static void disc_read_done(NcKernel *k, const DiscJob *j)
 {
     pin_buffer(k, j, -1);
@@ -1506,6 +1536,9 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
             nc_vm_will_write(run[i].va, run[i].len); /* pread into a protected page fails rather than faults */
             ok = nf->kind == F_DISC ? nc_disc_read_file(k->disc, &nf->disc, o, h, run[i].len)
                                     : pread(nf->fd, h, run[i].len, (off_t)o) == (ssize_t)run[i].len;
+            if (!ok && errno == EFAULT) {
+                ok = read_through_ram(k, nf, o, run[i].va, run[i].len);
+            }
             o += run[i].len;
         }
         if (!ok) {
