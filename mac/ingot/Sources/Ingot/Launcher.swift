@@ -57,7 +57,12 @@ final class Launcher: ObservableObject {
         return FileManager.default.isExecutableFile(atPath: u.path) ? u : nil
     }
 
-    func play(_ game: Game, fullscreen: Bool? = nil) {
+    /// Where the core leaves a title's launch data when it reboots into
+    /// another XBE (native/kernel/ex.c nc_kernel_relaunch_file); a relaunch
+    /// boot reads and deletes it.
+    static var relaunchFile: URL { Pref.hdd.deletingLastPathComponent().appendingPathComponent("relaunch.bin") }
+
+    func play(_ game: Game, fullscreen: Bool? = nil, relaunch: Bool = false) {
         guard running == nil else {
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -86,6 +91,11 @@ final class Launcher: ObservableObject {
         }
         let lang = d.integer(forKey: Pref.language)
         if lang > 0 { args.append("lang=\(lang)") }
+        if relaunch {
+            args.append("relaunch")
+        } else {
+            try? FileManager.default.removeItem(at: Self.relaunchFile)
+        }
 
         var env = ProcessInfo.processInfo.environment
         env["INGOT_TITLE"] = game.title
@@ -96,8 +106,11 @@ final class Launcher: ObservableObject {
 
         let safe = game.title.replacingOccurrences(of: "/", with: "-")
         let log = Self.logDir.appendingPathComponent("\(safe).log")
-        FileManager.default.createFile(atPath: log.path, contents: nil)
+        if !relaunch || !FileManager.default.fileExists(atPath: log.path) {
+            FileManager.default.createFile(atPath: log.path, contents: nil)
+        }
         let out = try? FileHandle(forWritingTo: log)
+        _ = try? out?.seekToEnd()
 
         let p = Process()
         p.executableURL = core
@@ -129,6 +142,12 @@ final class Launcher: ObservableObject {
         process = nil
         running = nil
         if stopping { return }
+        // The title rebooted into another XBE (KotOR II between areas): the core
+        // starts again where it left off.
+        if reason == .exit && status == 10 && FileManager.default.fileExists(atPath: Self.relaunchFile.path) {
+            play(game, relaunch: true)
+            return
+        }
         let why: String?
         if reason == .uncaughtSignal {
             why = "The emulator crashed (signal \(status))."
