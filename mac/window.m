@@ -508,9 +508,10 @@ void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
         CALayer *cover = cover_layer(layer);
         [w makeKeyAndOrderFront:nil];
         [NSApp activate];
-        if (getenv("INGOT_FULLSCREEN") && atoi(getenv("INGOT_FULLSCREEN"))) {
-            [w toggleFullScreen:nil];
-        }
+        /* full screen once the app is active (an inactive app's request is
+         * dropped: the first window after a relaunch's exec), or in 2 s */
+        bool want_full = getenv("INGOT_FULLSCREEN") && atoi(getenv("INGOT_FULLSCREEN"));
+        const CFTimeInterval full_by = CACurrentMediaTime() + 2.0;
         g_nw.layer = (__bridge const void *)layer;
 
         g_core = core;
@@ -552,6 +553,14 @@ void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
                     nc_pad_set(p, &s);
                 }
 
+                if (want_full && w.isVisible && (NSApp.isActive || CACurrentMediaTime() > full_by)) {
+                    want_full = false;
+                    if (!(w.styleMask & NSWindowStyleMaskFullScreen)) {
+                        [NSApp activate];
+                        [w makeKeyAndOrderFront:nil];
+                        [w toggleFullScreen:nil];
+                    }
+                }
                 g_win_full = w.styleMask & NSWindowStyleMaskFullScreen;
                 if (!g_win_full) {
                     g_win_frame = w.frame;

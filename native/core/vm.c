@@ -453,6 +453,27 @@ static bool movable(const NcVm *vm, uint32_t p)
     return va && !vm->pin[p] && !(g_na && g_na[p]) && vm->pte[va / NC_PAGE] == ((p * NC_PAGE) | NC_PTE_VALID);
 }
 
+/* A page that moving would part from a page of its host page that never
+ * moves (its physical address the title's): that host page could never be
+ * gathered again, and every access to it would trap. A contiguous
+ * allocation took KotOR II's stack pages from around one MmGetPhysicalAddress
+ * had pinned, and the thread ran at a few frames a second. */
+static bool strands_pin(const NcVm *vm, uint32_t p)
+{
+#ifdef NC_VM16K
+    const uint32_t n = 16384u / NC_PAGE, b = p & ~(n - 1), hp = vm->rmap[p] / (n * NC_PAGE);
+    for (uint32_t s = b; s < b + n && s * NC_PAGE < vm->ram_size; s++) {
+        if (s != p && (vm->pin[s] & NC_PIN_KNOWN) && vm->rmap[s] && vm->rmap[s] / (n * NC_PAGE) == hp) {
+            return true;
+        }
+    }
+#else
+    (void)vm;
+    (void)p;
+#endif
+    return false;
+}
+
 /* A free page a moved one can go to: one without guest access may still get
  * what the HLE owes it. */
 static bool takes_move(const NcVm *vm, uint32_t p)
@@ -951,14 +972,19 @@ void nc_vm_regroup(NcVm *vm)
             }
             if (!seen && s_logged < 32) {
                 s_seen[s_logged++] = want[w];
-                char why[160];
+                char why[200];
                 int o = 0;
                 for (uint32_t i = 0; i < NC_HOST_PAGES; i++) {
                     const uint32_t e = vm->pte[vp + i], p = e / NC_PAGE;
+                    char pin[24] = "";
+                    if ((e & NC_PTE_VALID) && p < ram_pages && vm->pin[p]) {
+                        snprintf(pin, sizeof pin, "(pinned%s, %u locks)", vm->pin[p] & NC_PIN_KNOWN ? " known" : "",
+                                 vm->pin[p] & 0x7Fu);
+                    }
                     o += snprintf(why + o, sizeof why - o, " %08x%s", e,
                                   !(e & NC_PTE_VALID) ? ""
                                   : p >= ram_pages    ? "(rom)"
-                                  : vm->pin[p]        ? "(pinned)"
+                                  : pin[0]            ? pin
                                   : movable(vm, p)    ? ""
                                                       : "(fixed)");
                 }
@@ -1031,7 +1057,7 @@ uint32_t nc_vm_alloc_phys_compact(NcVm *vm, uint32_t len, uint32_t lo, uint32_t 
         for (uint32_t i = 0; i < pages && ok; i++) {
             const uint32_t p = (uint32_t)s + i;
             if (vm->page_used[p]) {
-                ok = movable(vm, p);
+                ok = movable(vm, p) && !strands_pin(vm, p);
                 used++;
             }
         }
@@ -1111,7 +1137,7 @@ uint32_t nc_vm_alloc_phys_top(NcVm *vm, uint32_t len, uint32_t lo, uint32_t hi, 
         for (; i > 0; i--) {
             const uint32_t q = p + i - 1;
             if (vm->page_used[q]) {
-                if (!movable(vm, q)) {
+                if (!movable(vm, q) || strands_pin(vm, q)) {
                     break;
                 }
                 used++;
