@@ -18,6 +18,12 @@
  * Ingot's launcher names the window (INGOT_TITLE, else the disc's file
  * name), gives the app its icon (INGOT_ICON, a file), may start it full
  * screen (INGOT_FULLSCREEN=1) and shapes it 16:9 (INGOT_WIDESCREEN=1).
+ *
+ * A title that reboots into another XBE (XLaunchNewImage: KotOR II between
+ * areas) ends the core's run; the process execs itself again with relaunch,
+ * and the new window opens where the old one was (INGOT_FRAME), full screen
+ * if it was, showing the old one's last frame (INGOT_COVER) until the game
+ * presents.
  */
 #import <Cocoa/Cocoa.h>
 #import <GameController/GameController.h>
@@ -29,12 +35,26 @@
 #include "mac/window.h"
 
 #include <android/native_window.h>
+#include <crt_externs.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <stdlib.h>
 #include <unistd.h>
 
+void nc_kernel_relaunch_file(char *out, size_t n);
+uint8_t *hle_disp_read_front(uint32_t *w, uint32_t *h);
+void g_free(void *p);
+
 static struct ANativeWindow g_nw;
 static bool g_keys[128];
+/* the window as the main loop last saw it, for a relaunch */
+static NSRect g_win_frame;
+static bool g_win_full;
+/* a relaunch asks the main loop to hand this app's activation to the image it
+ * execs (macOS activates an app only when the active one yields to it) */
+static _Atomic bool g_yield;
+static dispatch_semaphore_t g_yielded;
 
 @interface NcView : NSView
 @end
@@ -290,9 +310,80 @@ static void assign_players(void)
 static int (*g_core)(void *);
 static void *g_core_arg;
 
+/* The front image as the cover file: width, height, then RGBA rows. */
+static bool write_cover(const char *path)
+{
+    uint32_t w = 0, h = 0;
+    uint8_t *px = hle_disp_read_front(&w, &h);
+    if (!px) {
+        return false;
+    }
+    FILE *f = fopen(path, "wb");
+    const uint32_t dim[2] = {w, h};
+    const bool ok = f && fwrite(dim, sizeof(dim), 1, f) == 1 && fwrite(px, (size_t)w * h * 4, 1, f) == 1;
+    if (f) {
+        fclose(f);
+    }
+    g_free(px);
+    return ok;
+}
+
+/* The core again in this process's place, booting what the relaunch file
+ * names; returns only if it couldn't (the launcher starts it then). */
+static void relaunch(void)
+{
+    char cover[512];
+    snprintf(cover, sizeof(cover), "%s/ingot-cover-%d.rgba", getenv("TMPDIR") ?: "/tmp", getpid());
+    if (write_cover(cover)) {
+        setenv("INGOT_COVER", cover, 1);
+    }    char frame[128];
+    snprintf(frame, sizeof(frame), "%g %g %g %g", g_win_frame.origin.x, g_win_frame.origin.y,
+             g_win_frame.size.width, g_win_frame.size.height);
+    setenv("INGOT_FRAME", frame, 1);
+    setenv("INGOT_FULLSCREEN", g_win_full ? "1" : "0", 1);
+    g_yield = true;
+    dispatch_semaphore_wait(g_yielded, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC));
+
+    const int argc = *_NSGetArgc();
+    char **argv = *_NSGetArgv();
+    char *args[argc + 2];
+    int n = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "relaunch")) {
+            args[n++] = argv[i];
+        }
+    }
+    args[n++] = "relaunch";
+    args[n] = NULL;
+
+    char exe[PATH_MAX];
+    uint32_t size = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &size)) {
+        return;
+    }
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    for (int fd = 0; fd < 3; fd++) {
+        posix_spawn_file_actions_addinherit_np(&fa, fd);
+    }
+    fflush(NULL);
+    posix_spawn(NULL, exe, &fa, &attr, args, *_NSGetEnviron());
+    fprintf(stderr, "hakuX-mac: relaunch: exec %s failed\n", exe);
+    unlink(cover);
+}
+
 static void *core_thread(void *arg)
 {
-    _exit(g_core(g_core_arg));
+    const int status = g_core(g_core_arg);
+    char file[512];
+    nc_kernel_relaunch_file(file, sizeof(file));
+    if (status == 10 && access(file, F_OK) == 0) {
+        relaunch();
+    }
+    _exit(status);
 }
 
 static void add_menus(NSString *app_name, NcDelegate *delegate)
@@ -324,6 +415,46 @@ static void add_menus(NSString *app_name, NcDelegate *delegate)
     pads_menu.delegate = delegate;
     pads_item.submenu = pads_menu;
     NSApp.mainMenu = bar;
+}
+
+/* The last frame before a relaunch (INGOT_COVER), over the layer until the
+ * game presents, or nil. */
+static CALayer *cover_layer(CALayer *layer)
+{
+    const char *path = getenv("INGOT_COVER");
+    if (!path) {
+        return nil;
+    }
+    NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+    unlink(path);
+    unsetenv("INGOT_COVER");
+    uint32_t dim[2];
+    if (data.length < sizeof(dim)) {
+        return nil;
+    }
+    memcpy(dim, data.bytes, sizeof(dim));
+    const size_t bytes = (size_t)dim[0] * dim[1] * 4;
+    if (!dim[0] || !dim[1] || data.length < sizeof(dim) + bytes) {
+        return nil;
+    }
+    CGDataProviderRef src = CGDataProviderCreateWithCFData(
+        (__bridge CFDataRef)[data subdataWithRange:NSMakeRange(sizeof(dim), bytes)]);
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGImageRef image = CGImageCreate(dim[0], dim[1], 8, 32, (size_t)dim[0] * 4, cs,
+                                     kCGBitmapByteOrderDefault | kCGImageAlphaNoneSkipLast, src, NULL, false,
+                                     kCGRenderingIntentDefault);
+    CGColorSpaceRelease(cs);
+    CGDataProviderRelease(src);
+    if (!image) {
+        return nil;
+    }
+    CALayer *cover = [CALayer layer];
+    cover.contents = (__bridge_transfer id)image;
+    cover.contentsGravity = kCAGravityResizeAspect;
+    cover.frame = layer.bounds;
+    cover.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    [layer addSublayer:cover];
+    return cover;
 }
 
 void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
@@ -367,9 +498,16 @@ void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
         view.wantsLayer = YES;
         w.contentView = view;
         [w makeFirstResponder:view];
-        [w center];
+        double fx, fy, fw, fh;
+        const char *frame = getenv("INGOT_FRAME");
+        if (frame && sscanf(frame, "%lf %lf %lf %lf", &fx, &fy, &fw, &fh) == 4 && fw > 0 && fh > 0) {
+            [w setFrame:NSMakeRect(fx, fy, fw, fh) display:NO];
+        } else {
+            [w center];
+        }
+        CALayer *cover = cover_layer(layer);
         [w makeKeyAndOrderFront:nil];
-        [NSApp activateIgnoringOtherApps:YES];
+        [NSApp activate];
         if (getenv("INGOT_FULLSCREEN") && atoi(getenv("INGOT_FULLSCREEN"))) {
             [w toggleFullScreen:nil];
         }
@@ -377,13 +515,13 @@ void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
 
         g_core = core;
         g_core_arg = arg;
+        g_yielded = dispatch_semaphore_create(0);
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 16u << 20);
         pthread_t t;
         pthread_create(&t, &attr, core_thread, NULL);
         pthread_attr_destroy(&attr);
-
         uint64_t n = 0;
         for (;;) {
             @autoreleasepool {
@@ -414,8 +552,24 @@ void nc_mac_window_run(const char *title, int (*core)(void *), void *arg)
                     nc_pad_set(p, &s);
                 }
 
+                g_win_full = w.styleMask & NSWindowStyleMaskFullScreen;
+                if (!g_win_full) {
+                    g_win_frame = w.frame;
+                }
+                if (g_yield) {
+                    g_yield = false;
+                    NSString *bid = NSBundle.mainBundle.bundleIdentifier;
+                    if (bid) {
+                        [NSApp yieldActivationToApplicationWithBundleIdentifier:bid];
+                    }
+                    dispatch_semaphore_signal(g_yielded);
+                }
+
                 if (!nc_present_frame(&g_nw)) {
                     usleep(8000);
+                } else if (cover) {
+                    [cover removeFromSuperlayer];
+                    cover = nil;
                 }
                 if (++n % 30 == 0) {
                     float fps, avg, last;

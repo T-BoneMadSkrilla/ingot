@@ -20,7 +20,7 @@ problems here, not upstream.
 
 ## Requirements
 
-- A Mac with Apple silicon, macOS 14 or later.
+- A Mac with Apple silicon, macOS 14.4 or later.
 - Your own game images (ISO or XISO), dumped from discs you own.
 
 No BIOS, MCPX ROM or hard disk image is needed. Ingot doesn't include any
@@ -37,6 +37,53 @@ builds the Metal core and `../build/Ingot.app`. Put your disc images in
 
 For the bare core, `ninja -C ../build/mac-metal xboxrun` and run
 `xboxrun <disc image> hdd=<folder>`.
+
+## Reporting a problem
+
+Open an issue at
+[github.com/T-BoneMadSkrilla/ingot/issues](https://github.com/T-BoneMadSkrilla/ingot/issues),
+one game and one problem per issue, with the game's log attached.
+
+### Getting the log
+
+Every game writes a log while it runs, to `~/Library/Logs/Ingot/<game>.log`.
+To find it, choose **Game › Show Logs** in Ingot (or click **Show Log** when
+Ingot says a game stopped), or in Finder choose **Go › Go to Folder…** and
+enter `~/Library/Logs/Ingot`.
+
+- **Copy the log right after the problem happens.** Starting the same game
+  again replaces its log.
+- If the game froze, quit it first (Cmd-Q in the game window, or **Game › Stop
+  Game** in Ingot), then copy the log.
+- Drag the `.log` file into the issue to attach it. Don't paste it into the
+  issue text: it can be thousands of lines. If GitHub says it's too large,
+  zip it first.
+
+### What to include
+
+- **Ingot version**, from **Ingot › About Ingot**.
+- **Your Mac**: the model and chip (M1, M2 Pro, ...) and the macOS version, from
+  **Apple menu › About This Mac**.
+- **The game**: its name and region (USA, Europe, Japan) and the image format
+  (ISO or XISO).
+- **What happened**: a crash, a freeze, graphics glitches, wrong or missing
+  sound, controls not working, the game not booting.
+- **Where it happens**: what you were doing when it happened (the menu, level,
+  cutscene or mode), and whether it happens every time from there.
+- **Your settings**, if you changed them from the defaults: render scale,
+  widescreen, HD modes, uncapped frame rate, language, and a hard disk folder
+  other than the default.
+- **Your controllers**, for input problems: which ones (Xbox, PlayStation,
+  keyboard) and which player each one was.
+- **A screenshot or a short video** for anything visual. Cmd-Shift-5 records
+  the screen.
+- **A save state**, if you made one near the problem (**Ingot Player › Save
+  State**, saved in `~/Library/Application Support/Ingot/States/`). Mention you
+  have one rather than attaching it: it can be large, and I'll ask for it if
+  it helps.
+
+Never attach game images, BIOS or dashboard files, or any other copyrighted
+Xbox software. Issues that include them will be closed.
 
 ## License
 
