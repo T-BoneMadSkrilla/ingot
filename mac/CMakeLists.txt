@@ -2,6 +2,10 @@
 # can run on a 16 KiB-page host. FEXCore from the fork, hakuX's CPU glue, and
 # the 4 KiB-on-16 KiB guest memory layer with its smoke test.
 cmake_minimum_required(VERSION 3.20)
+# Ingot's minimum (mac/ingot/build.sh LSMinimumSystemVersion; FEX's futex
+# needs 14.4's os_sync): newer APIs need @available, and the compiler says
+# where one is missing.
+set(CMAKE_OSX_DEPLOYMENT_TARGET 14.4 CACHE STRING "")
 project(hakux_mac LANGUAGES C CXX OBJC)
 
 if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")

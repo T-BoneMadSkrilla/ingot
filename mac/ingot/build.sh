@@ -15,7 +15,7 @@ out="${1:-$src/../build}"
 core_build="${INGOT_CORE_BUILD:-$out/mac-metal}"
 work="$out/ingot"
 app="$out/Ingot.app"
-version="0.1.3"
+version="0.1.4"
 
 mkdir -p "$work"
 if [ ! -f "$core_build/build.ninja" ]; then
@@ -23,7 +23,7 @@ if [ ! -f "$core_build/build.ninja" ]; then
 fi
 ninja -C "$core_build" xboxrun
 
-swiftc -O -parse-as-library -target arm64-apple-macos14 "$here"/Sources/Ingot/*.swift -o "$work/Ingot"
+swiftc -O -parse-as-library -target arm64-apple-macos14.4 "$here"/Sources/Ingot/*.swift -o "$work/Ingot"
 
 if [ ! -f "$work/Ingot.icns" ] || [ "$here/make_icon.swift" -nt "$work/Ingot.icns" ] ||
    [ "$here/icon.png" -nt "$work/Ingot.icns" ]; then
@@ -52,7 +52,7 @@ plist() { # name, executable, identifier, extra keys
   <key>CFBundleIconFile</key><string>Ingot</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.4</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSHumanReadableCopyright</key><string>Free software under the GNU GPL v3 or later. Based on hakuX.</string>

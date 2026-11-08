@@ -80,7 +80,11 @@ int hle_mtl_init(void)
     g_mtl.bc = g_mtl.dev.supportsBCTextureCompression;
     NSError *err = nil;
     MTLCompileOptions *co = [MTLCompileOptions new];
-    co.mathMode = MTLMathModeSafe;
+    if (@available(macOS 15.0, *)) {
+        co.mathMode = MTLMathModeSafe;
+    } else {
+        co.fastMathEnabled = NO;
+    }
     g_mtl.lib = [g_mtl.dev newLibraryWithSource:k_msl options:co error:&err];
     if (!g_mtl.lib) {
         hle_log("hakuX-hle-back", "mtl: back end shaders: %s", err.localizedDescription.UTF8String);
