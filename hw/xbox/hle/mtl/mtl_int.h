@@ -27,8 +27,9 @@ typedef struct HleMtl {
     bool bc;                        /* BC1-3 textures */
 } HleMtl;
 extern HleMtl g_mtl;
-/* Pipelines built off the render thread (the app's setting, dev.m) */
-extern bool g_mtl_pipe_async;
+/* Pipelines built off the render thread; the recorded ones built before
+ * the game (the app's settings, dev.m) */
+extern bool g_mtl_pipe_async, g_mtl_pipe_prebuild;
 
 /* A render pipeline of the back end's shaders (fs: fragment function),
  * colour format cf (Invalid: none), depth format df (stencil: it has one),
@@ -97,8 +98,16 @@ void hle_mtl_draw_state_part(const HleCmdStatePart *p);
 void hle_mtl_draw_vsh(const HleCmdVsh *c);
 void hle_mtl_draw_tex(const HleCmdTex *c);
 void hle_mtl_draw_forget(uint32_t id);
+/* Every texture gone (HLE_OP_OBJ_RESET); the pipeline and shader caches stay. */
+void hle_mtl_draw_forget_all(void);
 void hle_mtl_draw_upload_flush(void);
 void hle_mtl_draw_submitted(uint64_t value);
+/* A title's start (the boot thread, no draws running): its pipeline record
+ * read and appended to from now, its pipelines built first (build) */
+void hle_mtl_draw_prebuild(bool build);
+/* The record's new pipelines written: at most once a second (render thread),
+ * now for a run about to exit */
+void hle_mtl_draw_rec_flush(bool now);
 uint64_t hle_tl_completed(void);
 /* a new pass: the encoder has none of the draws' state */
 void hle_mtl_draw_pass(void);

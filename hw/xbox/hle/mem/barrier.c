@@ -603,6 +603,22 @@ int hle_mem_stale_neighbour(uint32_t lo, uint32_t hi)
     return r;
 }
 
+void hle_barrier_reset(void)
+{
+    stale_lock();
+    while (g_nna) {
+        na_drop(g_nna - 1);
+    }
+    if (g_hot) {
+        memset(g_hot, 0, g_ram >> 12);
+        memset(g_nbr_n, 0, (g_ram >> 12) * sizeof(*g_nbr_n));
+    }
+    stale_unlock();
+    if (g_contended) {
+        memset(g_contended, 0, ((g_ram >> 12) / 32 + 1) * sizeof(*g_contended));
+    }
+}
+
 /* [pa, pa + len) freed: its guards go, its pages hot no more */
 void hle_barrier_freed(uint32_t pa, uint32_t len)
 {

@@ -407,6 +407,34 @@ extern "C" NcCpu* nc_cpu_create(const NcCpuConfig* cfg, uint32_t fs_base) {
   return cpu;
 }
 
+extern "C" void nc_cpu_reset(NcCpu* cpu) {
+  if (cpu->X87Single) {
+    cpu->X87Single = false;
+    cpu->CTX->DisableX87SinglePrecision();
+  }
+  {
+    std::scoped_lock Lock(cpu->CTX->GetCodeInvalidationMutex());
+    cpu->CTX->ClearCodeCache(cpu->Thread, true);
+  }
+  auto* Frame = cpu->Thread->CurrentFrame;
+  __atomic_store_n(&Frame->InterruptPending, 0u, __ATOMIC_RELAXED);
+  Frame->HookBypass = 0;
+  // the GDT as nc_cpu_create made it (a title's descriptor writes undone)
+  using FEXCore::Core::CPUState;
+  const uint64_t FsBase = CPUState::CalculateGDTBase(cpu->Gdt[5]);
+  for (auto& G : cpu->Gdt) {
+    G = {};
+    CPUState::SetGDTBase(&G, 0);
+    CPUState::SetGDTLimit(&G, 0xF'FFFFu);
+    G.D = 1;
+    G.P = 1;
+    G.S = 1;
+    G.G = 1;
+  }
+  CPUState::SetGDTBase(&cpu->Gdt[5], FsBase);
+  Load(Frame->State, cpu->Reset);
+}
+
 extern "C" void nc_cpu_run(NcCpu* cpu, const NcCpuContext* c) {
   nc_frame_load(reinterpret_cast<NcFrame*>(cpu->Thread->CurrentFrame), c);
   cpu->CTX->ExecuteThread(cpu->Thread);

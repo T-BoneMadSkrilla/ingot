@@ -515,3 +515,12 @@ bool nc_timr_state_load(NcRd *r, unsigned v)
     g_ndpcs = st.ndpcs;
     return !r->fail;
 }
+
+void nc_timer_reset(void)
+{
+    memset(g_timers, 0, sizeof(g_timers));
+    memset(g_dpcs, 0, sizeof(g_dpcs));
+    memset(g_dpc_t, 0, sizeof(g_dpc_t));
+    memset(&g_dpc_run, 0, sizeof(g_dpc_run));
+    g_ntimers = g_dpc_head = g_ndpcs = 0;
+}

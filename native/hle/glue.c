@@ -20,6 +20,7 @@
 #include "native/core/irq.h"
 #include "hw/xbox/hle/pb/pbmode.h"
 #include "hw/xbox/hle/pb/pbdraw.h"
+#include "hw/xbox/hle/mem/barrier.h"
 #include "hw/xbox/hle/host.h"
 
 #include <dlfcn.h>
@@ -124,6 +125,19 @@ void nc_hle_boot(NcKernel *k, NcVm *vm, NcCpu *cpu, const NcCpuContext *boot)
         nc_hle_set_fatal(NC_FATAL_DRIVER, g_hle_unavailable);
         nc_log("hakuX-native-hle", "can't run the title: %s", g_fatal);
     }
+}
+
+bool nc_hle_reset(void)
+{
+    if (hle_active()) {
+        hle_title_stop();               /* the decoder joined */
+        hle_pbd_reset_objects();        /* the GPU done with the title's memory */
+        hle_barrier_reset();
+    }
+    g_active = false;
+    g_fatal_kind = NC_FATAL_NONE;
+    __atomic_store_n(&g_fatal[0], 0, __ATOMIC_RELEASE);
+    return true;
 }
 
 const char *nc_hle_fatal(void)

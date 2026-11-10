@@ -517,6 +517,22 @@ void nc_dev_aci_init(struct NcVm *vm)
     pthread_detach(t);
 }
 
+/* An in-place reboot's: the registers as nc_dev_aci_init left them. */
+void nc_dev_aci_reset(void)
+{
+    Aci *a = &g_aci;
+    pthread_mutex_lock(&a->lock);
+    a->glob_cnt = a->glob_sta = a->cas = 0;
+    memset(a->ch, 0, sizeof(a->ch));
+    for (unsigned i = 0; i < NCH; i++) {
+        a->ch[i].sr = SR_DCH;
+    }
+    mixer_reset(a);
+    a->po_bytes = 0;
+    update_irq(a);
+    pthread_mutex_unlock(&a->lock);
+}
+
 /* ---------------------------------------------------------- savestates */
 
 #define NC_DEF_SECTION ACI

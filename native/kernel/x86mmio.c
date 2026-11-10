@@ -23,6 +23,13 @@ static uint8_t g_strikes[SITES]; /* removals, kept per slot of a removed site */
 static uint32_t g_pending[PENDING];
 static volatile unsigned g_npending;
 
+void nc_x86mmio_reset(void)
+{
+    memset(g_site, 0, sizeof(g_site));
+    memset(g_strikes, 0, sizeof(g_strikes));
+    g_npending = 0;
+}
+
 static unsigned slot_of(uint32_t eip)
 {
     unsigned h = (eip * 2654435761u) % SITES;

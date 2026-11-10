@@ -554,32 +554,36 @@ static void flush_later(const NcFile *nf)
     close_later(&d);
 }
 
+static void file_close(NcFile *nf)
+{
+    if (nf->fd >= 0 && nf->wrote) {
+        close_later(nf);
+    } else {
+        if (nf->fd >= 0) {
+            close(nf->fd);
+        }
+        if (nf->old_path[0]) {
+            unlink(nf->old_path);
+        }
+    }
+    if (nf->del) {
+        NcFile *o = file_other(nf, nf->host, false);
+        if (o) {
+            o->del = true;                      /* the last handle deletes it */
+        } else {
+            unlink(nf->host);
+        }
+    }
+    free(nf->listing);
+    nf->listing = NULL;
+    nf->used = false;
+}
+
 void nc_io_close(NcKernel *k, uint32_t object)
 {
     uint32_t i = nc_vm_rd32(k->vm, object + FO_INDEX);
     if (i < MAX_FILES && g_files[i].used) {
-        NcFile *nf = &g_files[i];
-        if (nf->fd >= 0 && nf->wrote) {
-            close_later(nf);
-        } else {
-            if (nf->fd >= 0) {
-                close(nf->fd);
-            }
-            if (nf->old_path[0]) {
-                unlink(nf->old_path);
-            }
-        }
-        if (nf->del) {
-            NcFile *o = file_other(nf, nf->host, false);
-            if (o) {
-                o->del = true;                      /* the last handle deletes it */
-            } else {
-                unlink(nf->host);
-            }
-        }
-        free(nf->listing);
-        nf->listing = NULL;
-        nf->used = false;
+        file_close(&g_files[i]);
     }
 }
 
@@ -2818,6 +2822,21 @@ static void file_drop(NcFile *nf)
         free(nf->listing);
         memset(nf, 0, sizeof(*nf));     /* only those used: the rest stay untouched */
     }
+}
+
+void nc_io_reset(void)
+{
+    /* the title's handles closed as its NtClose would (nc_io_state_drain
+     * first: no read in flight) */
+    for (unsigned i = 0; i < MAX_FILES; i++) {
+        if (g_files[i].used) {
+            file_close(&g_files[i]);
+        }
+        memset(&g_files[i], 0, sizeof(g_files[i]));
+    }
+    memset(g_fs_cache, 0, sizeof(g_fs_cache));
+    memset(g_links, 0, sizeof(g_links));
+    memset(g_devices, 0, sizeof(g_devices));
 }
 
 bool nc_file_state_load(NcRd *r, unsigned v)

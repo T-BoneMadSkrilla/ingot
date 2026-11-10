@@ -59,6 +59,10 @@ typedef struct NcVm {
 #define NC_PTE_VALID 1u
 
 bool nc_vm_init(NcVm *vm, uint32_t ram_size);
+/* For an in-place reboot: nothing mapped but the windows, every physical
+ * page free (below 0x10000 claimed, as at init) and zero, nothing tracked or
+ * pinned. The guest stopped and the devices and GPU quiet. */
+bool nc_vm_reset(NcVm *vm);
 
 /* Map guest VA [va, va+len) onto physical [pa, pa+len). Page-aligned. */
 bool nc_vm_map(NcVm *vm, uint32_t va, uint32_t pa, uint32_t len);
@@ -175,6 +179,8 @@ void nc_vm_free_runs(const NcVm *vm, char *buf, size_t len);
 #ifdef NC_VM16K
 #include <signal.h>
 bool nc_vm16k_init(NcVm *vm);
+/* nc_vm_reset's: every host page unmapped, the JIT's patch sites gone. */
+void nc_vm16k_reset(NcVm *vm);
 /* Guest pages [va, va + len) now have prot (their pte as set): the host pages over them follow. */
 void nc_vm16k_protect(NcVm *vm, uint32_t va, uint32_t len, int prot);
 /* The host pages over [va, va + len) after their ptes changed. */

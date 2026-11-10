@@ -285,6 +285,19 @@ struct NcKernel {
 };
 
 bool nc_kernel_init(NcKernel *k, NcVm *vm);
+/* For an in-place reboot, before nc_vm_reset and nc_kernel_init again: what
+ * the title left in the kernel's files (its memory, timers and DPCs, page
+ * tables, open files and links, hooked sites) gone, its files closed. The
+ * console's settings stay. */
+bool nc_kernel_reset(NcKernel *k);
+void nc_mm_reset(void);
+void nc_timer_reset(void);
+void nc_paging_reset(void);
+void nc_io_reset(void);
+void nc_ke_reset(void);
+void nc_x86mmio_reset(void);
+void nc_fixups_reset(void);
+void nc_intr_reset(void);
 /* Before nc_kernel_init: the boot is for a savestate whose process object is
  * at kprocess (0: none), and the kernel pool's first range goes where the
  * boot that made it put it, under that object (kernel.c POOL_BASE). */

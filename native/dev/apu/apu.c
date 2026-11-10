@@ -760,6 +760,15 @@ void nc_dev_apu_init(NcVm *vm)
     }
 }
 
+void nc_dev_apu_reset(void)
+{
+    MCPXAPUState *d = g_state;
+    mcpx_apu_reset(d);
+    pthread_mutex_lock(&d->lock);
+    update_irq(d);
+    pthread_mutex_unlock(&d->lock);
+}
+
 void nc_dev_apu_spin_wait(const uint32_t *word)
 {
     mcpx_apu_spin_wait(); /* GP frames run to completion meanwhile */

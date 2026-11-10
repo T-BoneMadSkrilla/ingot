@@ -32,6 +32,7 @@ enum HleOp {
     HLE_OP_ZREAD = 23,          /* HleCmdZRead: a depth-stencil surface read as colour */
     HLE_OP_UPLOAD = 25,         /* HleCmdUpload: guest-memory texels into a surface */
     HLE_OP_ZWRITE = 26,         /* HleCmdZWrite: a colour surface's words as depth */
+    HLE_OP_OBJ_RESET = 27,      /* no payload: every object gone (the next title's, a reboot in place) */
 };
 
 /* Colour surface dst gets depth-stencil surface src (same size) as the

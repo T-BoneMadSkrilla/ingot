@@ -1069,3 +1069,12 @@ bool nc_mm_state_load(NcRd *r, unsigned v)
     g_gpu_instance_end = st.gpu_instance_end;
     return !r->fail;
 }
+
+void nc_mm_reset(void)
+{
+    memset(g_regions, 0, sizeof(g_regions));
+    memset(g_contig, 0, sizeof(g_contig));
+    memset(g_kept, 0, sizeof(g_kept));
+    g_nregions = g_ncontig = g_nkept = 0;
+    g_gpu_instance_end = 0;
+}

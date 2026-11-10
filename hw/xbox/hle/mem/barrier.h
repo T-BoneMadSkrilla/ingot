@@ -75,6 +75,9 @@ void hle_barrier_guard_stats(uint64_t *neighbours, uint64_t *hot);
 /* Guest memory freed (native/core/vm.c): the guards over it dropped, its
  * pages hot no more */
 void hle_barrier_freed(uint32_t pa, uint32_t len);
+/* An in-place reboot's: every guard and stale frame dropped (their pages
+ * open again), nothing hot or contended. */
+void hle_barrier_reset(void);
 /* The host, at a guest access to a page without access (hle_barrier_set_stale,
  * a guard; write: a store, or not known): the image in, the access back. */
 void hle_mem_stale_access(uint32_t pa);

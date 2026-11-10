@@ -985,6 +985,24 @@ void nc_kernel_clock_arm(NcKernel *k)
     pthread_mutex_unlock(&g_clock_mu);
 }
 
+bool nc_kernel_reset(NcKernel *k)
+{
+    (void)k;
+    pthread_mutex_lock(&g_clock_mu);
+    g_clock_due = 0;
+    pthread_mutex_unlock(&g_clock_mu);
+    nc_mm_reset();
+    nc_timer_reset();
+    nc_paging_reset();
+    nc_io_reset();
+    nc_ke_reset();
+    nc_x86mmio_reset();
+    nc_fixups_reset();
+    nc_intr_reset();
+    g_pool_at = 0;
+    return true;
+}
+
 /* Timers and wait timeouts that are due: fire them, wake their threads, and
  * reschedule if one of those outranks the running thread. Then the running
  * thread's slice. */

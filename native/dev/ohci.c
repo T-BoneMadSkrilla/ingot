@@ -736,6 +736,27 @@ void nc_dev_ohci_init(struct NcVm *vm)
            front_hub ? " behind the front panel hub" : "");
 }
 
+/* An in-place reboot's: the controller and its devices as at power-on, the
+ * controllers plugged in now still in. */
+void nc_dev_ohci_reset(void)
+{
+    Ohci *o = &g_ohci;
+    pthread_mutex_lock(&o->lock);
+    for (unsigned p = 0; p < 4; p++) {
+        NcUsbDev *pad = g_pad_hub[p] ? nc_usb_hub_child(g_pad_hub[p], 1) : NULL;
+        if (pad) {
+            nc_usb_reset(pad);
+        }
+    }
+    o->ctl = 0;
+    soft_reset(o);
+    o->ctl = 0;
+    roothub_reset(o);
+    o->frames = o->tds = 0;
+    o->frame_t0_ns = now_ns();
+    pthread_mutex_unlock(&o->lock);
+}
+
 /* A controller plugged in or pulled out, as on the console: its root port
  * shows the connection change and the title's USB stack finds the gamepad,
  * or sees it go. Only the controllers the players have are plugged in; one

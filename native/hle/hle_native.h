@@ -17,6 +17,10 @@ extern "C" {
 /* Before the guest runs: the HLE layer's init (posture from HAKUX_HLE_MODE;
  * off unless set) and, if active, its title start (push-buffer mode). */
 void nc_hle_boot(NcKernel *k, NcVm *vm, NcCpu *cpu, const NcCpuContext *boot);
+/* An in-place reboot's, before guest memory is reset: the title stopped, its
+ * GPU work done and its surfaces, textures and guards gone; nc_hle_boot
+ * then starts the next. */
+bool nc_hle_reset(void);
 
 /* Why the title can't run on this device (the HLE GPU did not start), or
  * NULL. */

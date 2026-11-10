@@ -1000,3 +1000,19 @@ bool nc_misc_state_load(NcRd *r, unsigned v)
     nc_rec_get(r, &nc_rec_NcMiscState, &st, v);
     return pages_get(r, g_misc, MISC_SIZE, st.npages);
 }
+
+/* The registers as nc_dev_nv2a_init and nc_dev_misc_init left them, the
+ * vblank going on at the video mode's rate (an in-place reboot's). */
+void nc_dev_nv2a_reset(void)
+{
+    NcRd none = {0};
+    pages_get(&none, g_regs, NV2A_SIZE, 0);
+    pages_get(&none, g_misc, MISC_SIZE, 0);
+    nc_wr32(g_regs + NV_PMC_BOOT_0, 0x02A000A1u);
+    nc_wr32(g_regs + NV_PFB_CSTATUS, 64u << 20);
+    nc_dev_nv2a_refresh(60);
+    g_last_vblank_ns = now_ns();
+    g_disp_vsync_ns = 0;
+    g_pick_off_ns = -1;
+    update_irq();
+}

@@ -211,6 +211,9 @@ const char *nc_state_save(const char *path)
     if (!g_core) {
         return "no game is running";
     }
+    if (nc_core_rebooting()) {
+        return "the game is starting its next program";
+    }
     if (!hle_pb_active()) {
         return "savestates need push-buffer mode";
     }

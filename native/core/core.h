@@ -40,6 +40,16 @@ void nc_core_set_dashboard(bool on);
 /* Runs the guest until it stops; logs the frontier summary. */
 void nc_core_run(NcCore *c);
 
+/* After nc_core_run stopped for a relaunch (XLaunchNewImage): the XBE the
+ * launch data page names boots in this process, on the guest's CPU thread,
+ * the memory, kernel, devices and CPU reset (off with NC_REBOOT_INPLACE=0). False:
+ * not rebooted, the launch data page and kept memory left for a new
+ * process's boot (nc_core_set_relaunch). */
+bool nc_core_reboot(NcCore *c);
+/* nc_core_reboot is under way: what reads the core (a savestate, the hang
+ * watchdog) waits. */
+bool nc_core_rebooting(void);
+
 /* The core works through faults: device registers (MMIO), the HLE GPU's
  * dirty tracking and the JIT's call-ret stack all trap. A front end's
  * SIGSEGV/SIGBUS handler calls this first; true means handled (return from

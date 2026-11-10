@@ -966,6 +966,19 @@ static unsigned g_site_fails;
 
 int nc_vm16k_site_run(NcHostRegs *r, __uint128_t *v, uint64_t site);
 
+void nc_vm16k_reset(NcVm *vm)
+{
+    memset(vm->vprot, 0, (1ull << 32) / NC_PAGE);
+    memset(vm->blk, 0, BLOCKS * sizeof(NcVmBlock));
+    memset(g_want, 0, sizeof(g_want));
+    g_nwant = 0;
+    g_want_any = false;
+    memset(g_sitehot, 0, sizeof(g_sitehot));
+    memset(g_site_slot, 0, sizeof(g_site_slot));
+    g_nsite = 0;
+    g_arena.gen = 0;    /* the stubs went with the JIT's code buffers */
+}
+
 void nc_vm16k_set_jit(bool (*is_jit)(uintptr_t pc), const NcCodeTail *tail)
 {
     g_tail = tail;

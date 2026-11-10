@@ -1388,6 +1388,12 @@ static uint64_t KeNoBoost(NcKernel *k, NcFrame *f, const uint32_t *a)
     return 0;
 }
 
+void nc_ke_reset(void)
+{
+    g_times_t = 0;          /* the next title's tick count from its boot */
+    g_entry_ns = 0;
+}
+
 void nc_ke_register(NcKernel *k)
 {
     g_boot_ns = nc_ke_now_ns();

@@ -90,6 +90,10 @@ void hle_back_set_frame_hook(const HleFrameHook *hook);
  * pipelines made written now, for a run that ends in an exit (the process
  * never reaches the GPU's teardown, nor the next periodic write). */
 void hle_back_save_caches(void);
+/* A title in push-buffer mode starts (its boot thread, before its first
+ * draw; after a reboot in place too, the back end running): the Metal back
+ * end builds the pipelines it recorded for it. */
+void hle_back_title(void);
 
 
 #endif

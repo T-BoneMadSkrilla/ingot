@@ -115,6 +115,10 @@ typedef struct NcCpuConfig {
 /* Creates the JIT and its one host thread state: flat segments, FS at
  * fs_base (the KPCR, shared by all guest threads). */
 NcCpu *nc_cpu_create(const NcCpuConfig *cfg, uint32_t fs_base);
+/* For the next title of an in-place reboot: every translation dropped, the
+ * GDT and the thread state as nc_cpu_create made them, x87 single precision
+ * off. On the guest's thread, the guest stopped. */
+void nc_cpu_reset(NcCpu *cpu);
 
 /* A new guest thread's initial state: the JIT's reset state (EFLAGS 0x202,
  * default x87 control word and MXCSR) at eip with esp. */

@@ -66,4 +66,10 @@ const char *hle_msl_tex(HleMsl *m, unsigned bits);
 /* HleS's end and the entry point; its length, 0 if it does not fit. */
 size_t hle_msl_entry(const HleMsl *m, char *buf, size_t cap);
 
+/* A fragment shader's pc.tex[s] read as the constant slot pair Metal binds
+ * (s | (s + 1) << 16), in place: picked at run time from the push block,
+ * every sample indexed the texture and sampler arrays dynamically (THUG:
+ * ~10x the fragment time). */
+void hle_msl_fold_slots(char *src, size_t len);
+
 #endif

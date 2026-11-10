@@ -360,6 +360,11 @@ static void ff_regs_init(void)
 
 bool hle_pbd_start(void)
 {
+    g_free(g_pd.idx);                       /* the last title's (a reboot in place) */
+    g_free(g_pd.idx16);
+    g_free(g_pd.tex);
+    g_free(g_pd.imm);
+    g_free(g_pd.inl);
     memset(&g_pd, 0, sizeof(g_pd));
     ff_regs_init();
     vsh_forget();                           /* program memory starts empty */
@@ -377,6 +382,7 @@ bool hle_pbd_start(void)
         hle_log("hakuX-hle-pb", "no back end: push-buffer mode draws nothing");
         return false;
     }
+    hle_back_title();
     hle_disp_present_late(true);
     coh_reset();
     hle_barrier_set_guard_fill(coh_fill);
@@ -390,6 +396,18 @@ void hle_pbd_stop(void)
     hle_barrier_set_guard_fill(NULL);
     hle_barrier_set_stale(0, 0, NULL);
     g_pd.on = false;
+}
+
+void hle_pbd_reset_objects(void)
+{
+    if (!hle_back_running()) {
+        return;
+    }
+    begin(HLE_OP_OBJ_RESET, 0);
+    HleCmdFence *f = begin(HLE_OP_KICK, sizeof(*f));
+    const uint64_t v = f->value = hle_fe_next_value();
+    hle_fe_commit();
+    hle_mem_wait_fence(v);
 }
 
 uint64_t hle_pbd_overlays(void)

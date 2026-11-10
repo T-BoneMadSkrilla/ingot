@@ -17,6 +17,9 @@
 /* The back end, at push-buffer mode's start; false if it can't run. */
 bool hle_pbd_start(void);
 void hle_pbd_stop(void);
+/* Push-buffer mode stopped (its decoder gone): the back end drops every
+ * surface and texture, and its work so far completes (an in-place reboot). */
+void hle_pbd_reset_objects(void);
 /* A Kelvin method (after the decoder's own handling). */
 void hle_pbd_method(uint32_t m, uint32_t v);
 /* n data words of one packet (method m, then +4 each unless noninc). */

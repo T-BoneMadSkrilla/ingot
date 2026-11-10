@@ -82,7 +82,11 @@ static void freed(uint32_t pa, uint32_t len)
 void nc_hle_dirty_init(NcVm *vm)
 {
     g_vm = vm; /* every page starts dirty (unprotected) */
-    g_hdirty = calloc(vm->ram_size / NC_PAGE, 1);
+    if (g_hdirty) {
+        memset(g_hdirty, 0, vm->ram_size / NC_PAGE);    /* a reboot in place */
+    } else {
+        g_hdirty = calloc(vm->ram_size / NC_PAGE, 1);
+    }
     nc_vm_write_hook = hle_va_store;
     nc_vm_read_hook = va_load;
     nc_vm_free_hook = freed;

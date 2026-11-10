@@ -126,6 +126,12 @@ void nc_intr_isr_line_set(uint8_t line)
     g_isr_line = line;
 }
 
+void nc_intr_reset(void)
+{
+    memset(g_hold, 0, sizeof(g_hold));
+    g_isr_line = 0xFF;
+}
+
 static void hold_note(NcKernel *k, uint32_t lines, uint8_t why)
 {
     for (unsigned l = 0; l < NC_IRQ_LINES; l++) {

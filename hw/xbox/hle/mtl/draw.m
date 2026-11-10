@@ -12,6 +12,7 @@
 #include "hw/xbox/hle/mtl/mtl_int.h"
 
 #include <math.h>
+#include <sys/stat.h>
 
 #include "hw/xbox/hle/hitch.h"
 #include "hw/xbox/hle/hle.h"
@@ -109,7 +110,10 @@ static struct {
     NSMutableDictionary<NSNumber *, id> *built;
     dispatch_queue_t workers[3];
     unsigned next_worker, inflight;
-    uint64_t async_queued, async_skips;
+    uint64_t async_queued, async_skips, async_waited;
+    /* the frame's wait for quick builds left (GRACE_FRAME_NS a frame) */
+    uint64_t grace_frame;
+    int64_t grace_left;
 } g_dr;
 
 enum { DROP_STATE, DROP_DECL, DROP_PIPE, DROP_PRIM, DROP_ALIGN, DROP_N };
@@ -434,6 +438,7 @@ void hle_mtl_draw_submitted(uint64_t value)
         }
     }
     g_pool.unstamped = g_pool.wr;
+    hle_mtl_draw_rec_flush(false);
 }
 
 void hle_mtl_draw_forget(uint32_t id)
@@ -444,6 +449,21 @@ void hle_mtl_draw_forget(uint32_t id)
         t->tex = nil;
         t->id = 0;
     }
+}
+
+void hle_mtl_draw_forget_all(void)
+{
+    for (unsigned i = 0; i < HLE_MAX_TEX; i++) {
+        MtlTex *t = &g_dr.tex[i];
+        if (t->tex) {
+            pool_put(t->tex, t->k0, t->k1);
+        }
+        t->tex = nil;
+        t->id = 0;
+    }
+    memset(g_tex_hint, 0, sizeof(g_tex_hint));
+    g_dr.st_valid = false;
+    g_dr.rec.valid = false;
 }
 
 /* Uploads are blits from the arena in a command buffer of their own,
@@ -803,6 +823,7 @@ static bool pipeline_src(const PipeKey *k, const uint32_t *tok, uint32_t nslots,
         free(fsrc);
         return false;
     }
+    hle_msl_fold_slots(fsrc, fn);
     *vs = vsrc;
     *vlen = vn;
     *fs = fsrc;
@@ -810,9 +831,10 @@ static bool pipeline_src(const PipeKey *k, const uint32_t *tok, uint32_t nslots,
     return true;
 }
 
-/* The pipeline from its MSL (freed here). Any thread. */
+/* The pipeline from its MSL (freed here); how: the log line's note, NULL
+ * none (a prebuild's). Any thread. */
 static id<MTLRenderPipelineState> pipeline_compile(const PipeKey *k, char *vsrc, size_t vn,
-                                                   char *fsrc, size_t fn, bool async)
+                                                   char *fsrc, size_t fn, const char *how)
 {
     id<MTLRenderPipelineState> p = nil;
     int64_t t0 = hle_now_ns();
@@ -871,10 +893,12 @@ static id<MTLRenderPipelineState> pipeline_compile(const PipeKey *k, char *vsrc,
             }
         }
     }
-    hle_log("hakuX-hle-pipe", "mtl: pipeline vsh=%016llx fvf=0x%x %s=%u %s in %.1f ms%s",
-            (unsigned long long)k->vsh, k->vs.fvf, k->psh ? "combiners" : "stages",
-            k->psh ? k->pk.count & 0xFF : k->ps.nstages, p ? "ok" : "FAILED",
-            (hle_now_ns() - t0) / 1e6, async ? " (asynchronous)" : "");
+    if (how || !p) {
+        hle_log("hakuX-hle-pipe", "mtl: pipeline vsh=%016llx fvf=0x%x %s=%u %s in %.1f ms%s",
+                (unsigned long long)k->vsh, k->vs.fvf, k->psh ? "combiners" : "stages",
+                k->psh ? k->pk.count & 0xFF : k->ps.nstages, p ? "ok" : "FAILED",
+                (hle_now_ns() - t0) / 1e6, how ? how : " (prebuild)");
+    }
     free(vsrc);
     free(fsrc);
     return p;
@@ -890,6 +914,13 @@ static id<MTLRenderPipelineState> pipeline_compile(const PipeKey *k, char *vsrc,
  * first, or once (a texture baked at a level's load), a skip would stay:
  * its pipeline is built in place (vk/draw.c's rule). */
 #define SKIP_FRAMES 3
+
+/* A build the system's shader cache has (most of a title's after its first
+ * session) takes well under a millisecond: the draw waits that long for it
+ * instead of skipping, GRACE_FRAME_NS a frame at most, the build on a queue
+ * of its own (not behind a worker's slow ones). */
+#define GRACE_NS (1500ll * 1000)
+#define GRACE_FRAME_NS (4ll * 1000000)
 
 static void target_note(HleMtlSurf *s)
 {
@@ -927,13 +958,69 @@ static void pipes_collect(void)
     }];
 }
 
+/* ---- the pipeline record (vk/pipeasync.c's, for Metal) ------------------------
+ * The pipelines a title made, per title and XBE
+ * (<base>/hle_pipelines_mtl/<title>-<timedate>.bin: a header, then vertex
+ * programs and pipeline keys as they were made), built again before its
+ * first draw at its next start (hle_mtl_draw_prebuild). The system's shader
+ * cache keeps compiled functions but no pipelines: each session's first use
+ * of every one waited on a build, its draws skipped meanwhile (things
+ * popped in). */
+#define REC_MAGIC 0x434D5048u       /* "HPMC" */
+/* up with any change of PipeKey's layout or meaning: a record of the old
+ * one would build other pipelines */
+#define REC_VERSION 1
+#define REC_KEEP 8192               /* pipelines kept, the newest */
+#define PREBUILD_WAIT_NS (20ull * 1000000000ull)
+enum { REC_PROG = 1, REC_PIPE = 2 };
+
+typedef struct RecHdr {
+    uint32_t type, nslots;
+    uint64_t hash;
+} RecHdr;
+
+static struct {
+    FILE *f;                        /* appended to, NULL: no record */
+    uint32_t title, timedate;
+    NSMutableSet<NSNumber *> *progs, *pipes;    /* in the file */
+    int64_t flushed;
+    bool dirty;
+} g_rec;
+
+static void rec_put(uint32_t type, uint64_t hash, uint32_t nslots, const void *p, size_t n)
+{
+    const RecHdr h = { type, nslots, hash };
+    fwrite(&h, sizeof(h), 1, g_rec.f);
+    fwrite(p, n, 1, g_rec.f);
+    g_rec.dirty = true;
+}
+
+/* Render thread: a pipeline made this session (h: its key's hash) */
+static void rec_pipe(NSNumber *h, const PipeKey *k, const uint32_t *tok, uint32_t nslots)
+{
+    if (!g_rec.f || [g_rec.pipes containsObject:h]) {
+        return;
+    }
+    if (k->vsh) {
+        if (!tok) {
+            return;
+        }
+        if (![g_rec.progs containsObject:@(k->vsh)]) {
+            rec_put(REC_PROG, k->vsh, nslots, tok, 16 * (size_t)nslots);
+            [g_rec.progs addObject:@(k->vsh)];
+        }
+    }
+    rec_put(REC_PIPE, h.unsignedLongLongValue, 0, k, sizeof(*k));
+    [g_rec.pipes addObject:h];
+}
+
 /* The draw's pipeline: made (and remembered, failures included), or nil
  * with *pending while a worker builds it. */
 static id<MTLRenderPipelineState> pipeline(const PipeKey *k, HleMtlSurf *target, bool *pending)
 {
     *pending = false;
+    pipes_collect();                    /* the asynchronous builds' and the prebuild's */
     if (g_mtl_pipe_async) {
-        pipes_collect();
         target_note(target);
     }
     NSNumber *h = @(hash_bytes(k, sizeof(*k)));
@@ -957,27 +1044,193 @@ static id<MTLRenderPipelineState> pipeline(const PipeKey *k, HleMtlSurf *target,
         g_dr.pipe_fail++;
         return nil;
     }
+    rec_pipe(h, k, tok, nslots);
     if (g_mtl_pipe_async && g_dr.inflight < INFLIGHT_MAX && target_redrawn(target)) {
         const PipeKey key = *k;
+        const uint64_t frame = hle_back_swap_count();
+        if (g_dr.grace_frame != frame) {
+            g_dr.grace_frame = frame;
+            g_dr.grace_left = GRACE_FRAME_NS;
+        }
+        dispatch_semaphore_t done = g_dr.grace_left > 0 ? dispatch_semaphore_create(0) : nil;
         g_dr.pipes[h] = g_dr.building;
         g_dr.inflight++;
         g_dr.async_queued++;
-        dispatch_async(g_dr.workers[g_dr.next_worker++ % WORKERS], ^{
-            id<MTLRenderPipelineState> q = pipeline_compile(&key, vs, vn, fs, fn, true);
+        dispatch_async(done ? dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0) :
+                       g_dr.workers[g_dr.next_worker++ % WORKERS], ^{
+            id<MTLRenderPipelineState> q = pipeline_compile(&key, vs, vn, fs, fn, " (asynchronous)");
             @synchronized(g_dr.built) {
-                g_dr.built[h] = q ? q : [NSNull null];
+                g_dr.built[h] = q ? (id)q : [NSNull null];
+            }
+            if (done) {
+                dispatch_semaphore_signal(done);
             }
         });
+        if (done) {
+            const int64_t t0 = hle_now_ns();
+            const int64_t wait = g_dr.grace_left < GRACE_NS ? g_dr.grace_left : GRACE_NS;
+            const bool ready = !dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, wait));
+            g_dr.grace_left -= hle_now_ns() - t0;
+            if (ready) {
+                pipes_collect();
+                p = g_dr.pipes[h];
+                g_dr.async_waited++;
+                return p == [NSNull null] ? nil : p;
+            }
+        }
         *pending = true;
         return nil;
     }
     uint32_t pa = hle_hitch_enter(HLE_ACT_COMPILE);
-    p = pipeline_compile(k, vs, vn, fs, fn, false);
+    p = pipeline_compile(k, vs, vn, fs, fn, "");
     hle_hitch_leave(pa);
     g_dr.pipes[h] = p ? p : [NSNull null];
     g_dr.pipes_made += p != nil;
     g_dr.pipe_fail += p == nil;
     return p;
+}
+
+/* The record's pipelines, the newest REC_KEEP (oldest first), and their
+ * programs (hash -> tokens); false for no record, or another layout's */
+static bool rec_read(const char *path, NSMutableArray<NSData *> *keys,
+                     NSMutableDictionary<NSNumber *, NSData *> *progs)
+{
+    NSData *d = [NSData dataWithContentsOfFile:@(path)];
+    const uint8_t *p = d.bytes, *end = p + d.length;
+    uint32_t hdr[3];
+    if (d.length < sizeof(hdr)) {
+        return false;
+    }
+    memcpy(hdr, p, sizeof(hdr));
+    if (hdr[0] != REC_MAGIC || hdr[1] != REC_VERSION || hdr[2] != sizeof(PipeKey)) {
+        return false;
+    }
+    NSMutableDictionary<NSNumber *, NSNumber *> *at = [NSMutableDictionary new];
+    NSMutableArray *order = [NSMutableArray new];
+    for (p += sizeof(hdr); end - p >= (ptrdiff_t)sizeof(RecHdr);) {
+        RecHdr h;
+        memcpy(&h, p, sizeof(h));
+        p += sizeof(h);
+        const size_t n = h.type == REC_PROG ? 16 * (size_t)h.nslots :
+                         h.type == REC_PIPE ? sizeof(PipeKey) : SIZE_MAX;
+        if (n > (size_t)(end - p) || (h.type == REC_PROG && h.nslots > HLE_VSH_MAX_SLOTS)) {
+            break;                      /* a write cut short */
+        }
+        NSData *b = [NSData dataWithBytes:p length:n];
+        p += n;
+        if (h.type == REC_PROG) {
+            progs[@(h.hash)] = b;
+        } else if (hash_bytes(b.bytes, n) == h.hash) {
+            /* made again: its latest place */
+            NSNumber *i = at[@(h.hash)];
+            if (i) {
+                order[i.unsignedIntegerValue] = [NSNull null];
+            }
+            at[@(h.hash)] = @(order.count);
+            [order addObject:b];
+        }
+    }
+    for (id b in order) {
+        if (b != [NSNull null]) {
+            [keys addObject:b];
+        }
+    }
+    if (keys.count > REC_KEEP) {
+        [keys removeObjectsInRange:NSMakeRange(0, keys.count - REC_KEEP)];
+    }
+    return true;
+}
+
+void hle_mtl_draw_prebuild(bool build)
+{
+    const HleXbeInfo *x = &g_hle.title.xbe;
+    if (!g_dr.ready || !x->title_id ||
+        (g_rec.f && g_rec.title == x->title_id && g_rec.timedate == x->timedate)) {
+        return;
+    }
+    if (g_rec.f) {
+        fclose(g_rec.f);
+        g_rec.f = NULL;
+    }
+    const int64_t t0 = hle_now_ns();
+    char dir[512], path[600], tmp[610];
+    snprintf(dir, sizeof(dir), "%shle_pipelines_mtl", hle_host_base_path());
+    mkdir(dir, 0755);
+    snprintf(path, sizeof(path), "%s/%08x-%08x.bin", dir, x->title_id, x->timedate);
+    NSMutableArray<NSData *> *keys = [NSMutableArray new];
+    NSMutableDictionary<NSNumber *, NSData *> *progs = [NSMutableDictionary new];
+    const bool read = rec_read(path, keys, progs);
+
+    /* written back compact (each pipeline once, the programs they use), then
+     * appended to */
+    g_rec.title = x->title_id;
+    g_rec.timedate = x->timedate;
+    g_rec.progs = [NSMutableSet new];
+    g_rec.pipes = [NSMutableSet new];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    g_rec.f = fopen(tmp, "wb");
+    if (!g_rec.f) {
+        hle_log("hakuX-hle-pipe", "mtl: pipeline record %s: not writable", path);
+        return;
+    }
+    const uint32_t hdr[3] = { REC_MAGIC, REC_VERSION, (uint32_t)sizeof(PipeKey) };
+    fwrite(hdr, sizeof(hdr), 1, g_rec.f);
+    for (NSData *b in keys) {
+        const PipeKey *k = b.bytes;
+        NSData *t = k->vsh ? progs[@(k->vsh)] : nil;
+        if (!k->vsh || t) {
+            rec_pipe(@(hash_bytes(k, sizeof(*k))), k, t.bytes, (uint32_t)(t.length / 16));
+        }
+    }
+    fclose(g_rec.f);
+    rename(tmp, path);
+    g_rec.f = fopen(path, "ab");
+    g_rec.dirty = false;
+
+    /* built on every core at once, the game waiting (a pipeline it draws
+     * with before its build is done waits in pipes like an asynchronous
+     * one's) */
+    unsigned queued = 0;
+    dispatch_group_t grp = dispatch_group_create();
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    for (NSInteger i = build ? (NSInteger)keys.count - 1 : -1; i >= 0; i--) {
+        const PipeKey *k = keys[(NSUInteger)i].bytes;
+        NSNumber *h = @(hash_bytes(k, sizeof(*k)));
+        NSData *t = k->vsh ? progs[@(k->vsh)] : nil;
+        char *vs, *fs;
+        size_t vn, fn;
+        if (g_dr.pipes[h] || (k->vsh && !t) ||
+            !pipeline_src(k, t.bytes, (uint32_t)(t.length / 16), &vs, &vn, &fs, &fn)) {
+            continue;
+        }
+        const PipeKey key = *k;
+        g_dr.pipes[h] = g_dr.building;
+        g_dr.inflight++;
+        queued++;
+        dispatch_group_async(grp, q, ^{
+            id<MTLRenderPipelineState> p = pipeline_compile(&key, vs, vn, fs, fn, NULL);
+            @synchronized(g_dr.built) {
+                g_dr.built[h] = p ? (id)p : [NSNull null];
+            }
+        });
+    }
+    const bool all = !dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, PREBUILD_WAIT_NS));
+    const uint64_t failed = g_dr.pipe_fail;
+    pipes_collect();
+    hle_log("hakuX-hle-pipe", "mtl: pipeline record %s: %s, %lu pipelines; %u built before the "
+            "game in %.0f ms%s%s", path, read ? "read" : "new", (unsigned long)keys.count, queued,
+            (hle_now_ns() - t0) / 1e6, all ? "" : " (the rest go on building)",
+            g_dr.pipe_fail > failed ? ", some failed" : "");
+}
+
+void hle_mtl_draw_rec_flush(bool force)
+{
+    const int64_t now = hle_now_ns();
+    if (g_rec.f && g_rec.dirty && (force || now - g_rec.flushed > 1000000000ll)) {
+        fflush(g_rec.f);
+        g_rec.dirty = false;
+        g_rec.flushed = now;
+    }
 }
 
 static id<MTLDepthStencilState> depth_stencil(bool zt, bool zw, MTLCompareFunction zop, bool stn,
@@ -1782,10 +2035,11 @@ void hle_mtl_draw_diag(void)
 {
     hle_log("hakuX-hle-back", "mtl: draws=%llu pipelines=%llu (%llu failed) drops: state=%llu "
             "layout=%llu pipe=%llu prim=%llu align=%llu; asynchronous %llu built, %llu draws "
-            "skipped meanwhile",
+            "skipped meanwhile, %llu ready in time to draw",
             (unsigned long long)g_dr.draws, (unsigned long long)g_dr.pipes_made,
             (unsigned long long)g_dr.pipe_fail, (unsigned long long)g_dr.drops[DROP_STATE],
             (unsigned long long)g_dr.drops[DROP_DECL], (unsigned long long)g_dr.drops[DROP_PIPE],
             (unsigned long long)g_dr.drops[DROP_PRIM], (unsigned long long)g_dr.drops[DROP_ALIGN],
-            (unsigned long long)g_dr.async_queued, (unsigned long long)g_dr.async_skips);
+            (unsigned long long)g_dr.async_queued, (unsigned long long)g_dr.async_skips,
+            (unsigned long long)g_dr.async_waited);
 }

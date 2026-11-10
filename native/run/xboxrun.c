@@ -356,7 +356,7 @@ static void *watchdog(void *arg)
             _exit(5);
         }
 #endif
-        if (n != frames) {
+        if (n != frames || nc_core_rebooting()) {
             frames = n;
             since = now;
         } else if (g_hang_s && now - since >= g_hang_s * 1000ull) {
@@ -372,7 +372,9 @@ static void *watchdog(void *arg)
 static int run_core(void *arg)
 {
     (void)arg;
-    nc_core_run(&g_core);
+    do {
+        nc_core_run(&g_core);
+    } while (nc_core_reboot(&g_core));
     const NcKernel *k = &g_core.kernel;
     return k->quit || k->relaunch ? 10 : k->stop ? 7 : 0;
 }

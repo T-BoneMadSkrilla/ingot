@@ -370,6 +370,11 @@ void hle_prof_diag(void)
 
 void hle_init(void)
 {
+    static bool s_done;     /* again for a reboot in place: as the first left it */
+    if (s_done) {
+        return;
+    }
+    s_done = true;
     memset(&g_hle, 0, sizeof(g_hle));
     g_hle.posture = parse_posture(getenv("HAKUX_HLE_MODE"));
     hle_prof_init();

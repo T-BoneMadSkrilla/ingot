@@ -130,6 +130,40 @@ bool nc_vm_init(NcVm *vm, uint32_t ram_size)
     return true;
 }
 
+bool nc_vm_reset(NcVm *vm)
+{
+    void *r = mmap(vm->base, 1ull << 32, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    if (r != vm->base) {
+        nc_log("hakuX-native", "vm: reset failed: %s", strerror(errno));
+        return false;
+    }
+    const uint32_t pages = vm->ram_size / NC_PAGE;
+    pthread_mutex_lock(&g_prot_mu);
+    memset(vm->page_used, 0, pages);
+    memset(vm->pte, 0, (1ull << 32) / NC_PAGE * sizeof(uint32_t));
+    memset(vm->rmap, 0, (size_t)pages * sizeof(uint32_t));
+    memset(vm->wp, 0, pages);
+    memset(vm->pin, 0, pages);
+    if (g_na) {
+        memset(g_na, 0, pages);
+    }
+#ifdef NC_VM16K
+    if (g_fill) {
+        memset(g_fill, 0, pages);
+    }
+    g_nfill = 0;
+    nc_vm16k_reset(vm);
+#endif
+    pthread_mutex_unlock(&g_prot_mu);
+    memset(vm->phys, 0, vm->ram_size);
+    if (!nc_vm_map(vm, NC_CONTIG_WINDOW, 0, vm->ram_size) || !nc_vm_map(vm, NC_GPU_WINDOW, 0, vm->ram_size)) {
+        return false;
+    }
+    nc_vm_claim_phys(vm, 0, 0x10000);
+    nc_log("hakuX-native", "vm: reset, RAM %u MiB cleared", vm->ram_size >> 20);
+    return true;
+}
+
 bool nc_vm_map(NcVm *vm, uint32_t va, uint32_t pa, uint32_t len)
 {
     if ((va | pa | len) & (NC_PAGE - 1) || (uint64_t)pa + len > vm->ram_size ||

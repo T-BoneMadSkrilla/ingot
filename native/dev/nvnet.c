@@ -705,6 +705,11 @@ bool nc_nic_state_load(NcRd *r, unsigned v)
  * run's (its rings' addresses, the receiver on) works on the state's RAM. */
 void nc_nic_state_absent(void)
 {
+    nc_dev_nvnet_reset();
+}
+
+void nc_dev_nvnet_reset(void)
+{
     Nvnet *s = &g_nv;
     pthread_mutex_lock(&s->lock);
     nvnet_reset(s);

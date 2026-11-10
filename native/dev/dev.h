@@ -53,6 +53,14 @@ void nc_dev_nvnet_init(struct NcVm *vm);
 void nc_dev_nvnet_phy_init(void);
 uint32_t nc_dev_nvnet_link_state(void);
 
+/* An in-place reboot's (nc_core_reboot), the devices paused: each as its
+ * init left it, its threads and window kept. nv2a: the misc windows too. */
+void nc_dev_nv2a_reset(void);
+void nc_dev_apu_reset(void);
+void nc_dev_aci_reset(void);
+void nc_dev_nvnet_reset(void);
+void nc_dev_ohci_reset(void);
+
 /* x86 I/O ports (IN/OUT); bytes is 1, 2 or 4. */
 uint32_t nc_port_in(uint16_t port, unsigned bytes);
 void nc_port_out(uint16_t port, unsigned bytes, uint32_t value);

@@ -40,6 +40,10 @@ static struct {
     uint64_t dropped[32];               /* commands not done yet, by op */
 } g_back;
 
+/* the GPU's time on the game's command buffers (us, atomic): their busy
+ * share, and the longest one, in each draw diag */
+static uint64_t g_gpu_us, g_gpu_max_us;
+
 /* ---- recording -------------------------------------------------------------- */
 
 static id<MTLCommandBuffer> cb_get(void)
@@ -47,6 +51,15 @@ static id<MTLCommandBuffer> cb_get(void)
     if (!g_back.cb) {
         g_back.cb = [g_mtl.queue commandBuffer];
         [g_back.cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+            const double t = b.GPUEndTime - b.GPUStartTime;
+            if (t > 0 && t < 10) {
+                const uint64_t us = (uint64_t)(t * 1e6);
+                __atomic_fetch_add(&g_gpu_us, us, __ATOMIC_RELAXED);
+                uint64_t m = __atomic_load_n(&g_gpu_max_us, __ATOMIC_RELAXED);
+                while (us > m && !__atomic_compare_exchange_n(&g_gpu_max_us, &m, us, true,
+                                                              __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                }
+            }
             if (b.status == MTLCommandBufferStatusError) {
                 hle_log("hakuX-hle-back", "mtl: command buffer failed: %s",
                         b.error.localizedDescription.UTF8String);
@@ -72,6 +85,117 @@ static void color_of(uint32_t argb, float out[4])
 static void vis_pass_end(void);
 static void vis_stamp(uint64_t value);
 static id<MTLBuffer> vis_buffer(void);
+
+/* HAKUX_HLE_PASSPROF: each pass's GPU time (stage-boundary timestamps), the
+ * passes of one command buffer in ~2 s logged */
+#define PROF_N 512
+static struct {
+    bool on, tried;
+    id<MTLCounterSampleBuffer> sb;
+    unsigned next, first;               /* this command buffer's passes: first..next */
+    uint64_t draws0;
+    struct { uint32_t w, h, fmt, draws; bool depth, clear; } meta[PROF_N];
+    int64_t last_log;
+} g_prof;
+
+static void prof_init(void)
+{
+    g_prof.tried = true;
+    if (!getenv("HAKUX_HLE_PASSPROF") ||
+        ![g_mtl.dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        return;
+    }
+    for (id<MTLCounterSet> cs in g_mtl.dev.counterSets) {
+        if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+            MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+            d.counterSet = cs;
+            d.storageMode = MTLStorageModeShared;
+            d.sampleCount = PROF_N * 4;
+            g_prof.sb = [g_mtl.dev newCounterSampleBufferWithDescriptor:d error:nil];
+        }
+    }
+    g_prof.on = g_prof.sb != nil;
+    hle_log("hakuX-hle-back", "mtl: pass profiler %s", g_prof.on ? "on" : "unavailable");
+}
+
+static void prof_pass(MTLRenderPassDescriptor *rp, HleMtlSurf *rt, HleMtlSurf *ds, bool clear)
+{
+    if (!g_prof.tried) {
+        prof_init();
+    }
+    if (!g_prof.on) {
+        return;
+    }
+    const unsigned i = g_prof.next % PROF_N;
+    if (g_prof.next - g_prof.first >= PROF_N) {
+        return;
+    }
+    g_prof.next++;
+    HleMtlSurf *s = rt ? rt : ds;
+    g_prof.meta[i].w = s->w;
+    g_prof.meta[i].h = s->h;
+    g_prof.meta[i].fmt = s->fmt;
+    g_prof.meta[i].depth = ds != NULL;
+    g_prof.meta[i].clear = clear;
+    g_prof.meta[i].draws = UINT32_MAX;
+    g_prof.draws0 = g_back.st.draws;
+    rp.sampleBufferAttachments[0].sampleBuffer = g_prof.sb;
+    rp.sampleBufferAttachments[0].startOfVertexSampleIndex = i * 4;
+    rp.sampleBufferAttachments[0].endOfVertexSampleIndex = i * 4 + 1;
+    rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = i * 4 + 2;
+    rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = i * 4 + 3;
+}
+
+static void prof_pass_end(void)
+{
+    if (g_prof.on && g_prof.next != g_prof.first) {
+        g_prof.meta[(g_prof.next - 1) % PROF_N].draws = (uint32_t)(g_back.st.draws - g_prof.draws0);
+    }
+}
+
+static void prof_submit(id<MTLCommandBuffer> cb)
+{
+    if (!g_prof.on) {
+        return;
+    }
+    const unsigned a = g_prof.first, n = g_prof.next - g_prof.first;
+    g_prof.first = g_prof.next;
+    const int64_t now = g_get_monotonic_time();
+    if (!n || now - g_prof.last_log < 2000000) {
+        return;
+    }
+    g_prof.last_log = now;
+    typeof(g_prof.meta[0]) *meta = g_malloc(sizeof(g_prof.meta[0]) * n);
+    for (unsigned k = 0; k < n; k++) {
+        meta[k] = g_prof.meta[(a + k) % PROF_N];
+    }
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        const double span = (b.GPUEndTime - b.GPUStartTime) * 1e3;
+        char line[256];
+        double sum = 0;
+        for (unsigned k = 0; k < n; k++) {
+            const unsigned i = (a + k) % PROF_N;
+            NSData *d = [g_prof.sb resolveCounterRange:NSMakeRange(i * 4, 4)];
+            const MTLCounterResultTimestamp *t = d.length >= 32 ? d.bytes : NULL;
+            double ms[3] = { -1, -1, -1 };    /* the pass, its vertex stage, its fragment stage */
+            const int span[3][2] = { { 0, 3 }, { 0, 1 }, { 2, 3 } };
+            for (int j = 0; t && j < 3; j++) {
+                const uint64_t t0 = t[span[j][0]].timestamp, t1 = t[span[j][1]].timestamp;
+                if (t0 != MTLCounterErrorValue && t1 != MTLCounterErrorValue && t1 >= t0) {
+                    ms[j] = (t1 - t0) / 1e6;    /* Apple GPUs resolve them in ns */
+                }
+            }
+            sum += ms[0] > 0 ? ms[0] : 0;
+            snprintf(line, sizeof(line), "mtl: pass %u/%u %ux%u fmt %u%s%s draws %u: %.2f ms "
+                     "(vertex %.2f, fragment %.2f)", k + 1, n, meta[k].w, meta[k].h, meta[k].fmt,
+                     meta[k].depth ? " +depth" : "", meta[k].clear ? " clear" : "", meta[k].draws,
+                     ms[0], ms[1], ms[2]);
+            hle_log("hakuX-hle-back", "%s", line);
+        }
+        hle_log("hakuX-hle-back", "mtl: command buffer %.2f ms on the GPU, its passes %.2f ms", span, sum);
+        g_free(meta);
+    }];
+}
 
 static bool open_pass(void)
 {
@@ -122,6 +246,7 @@ static bool open_pass(void)
     rp.renderTargetWidth = w;
     rp.renderTargetHeight = h;
     rp.visibilityResultBuffer = vis_buffer();
+    prof_pass(rp, rt, ds, pf != 0);
     g_back.enc = [cb_get() renderCommandEncoderWithDescriptor:rp];
     g_back.prt = rt;
     g_back.pds = ds;
@@ -137,6 +262,7 @@ static void close_pass(void)
     }
     if (g_back.enc) {
         vis_pass_end();
+        prof_pass_end();
         [g_back.enc endEncoding];
         g_back.enc = nil;
         g_back.prt = g_back.pds = NULL;
@@ -164,6 +290,7 @@ static void submit(uint64_t value)
     id<MTLCommandBuffer> cb = cb_get();
     hle_tl_gap_serve();
     hle_mtl_tl_signal(cb, value);
+    prof_submit(cb);
     uint32_t pa = hle_hitch_enter(HLE_ACT_SUBMIT);
     [cb commit];
     hle_hitch_leave(pa);
@@ -399,6 +526,12 @@ void hle_back_set_frame_hook(const HleFrameHook *hook)
 
 void hle_back_save_caches(void)
 {
+    hle_mtl_draw_rec_flush(true);
+}
+
+void hle_back_title(void)
+{
+    hle_mtl_draw_prebuild(g_mtl_pipe_prebuild);
 }
 
 static void overlay_draw(id<MTLCommandBuffer> cb, id<MTLTexture> frame);
@@ -967,6 +1100,13 @@ static void dispatch(const HleCmdHdr *h)
         hle_mtl_draw_forget(d->id);
         break;
     }
+    case HLE_OP_OBJ_RESET:
+        close_pass();
+        hle_mtl_surf_destroy_all();
+        hle_mtl_draw_forget_all();
+        g_back.rt = g_back.ds = 0;
+        hle_log("hakuX-hle-back", "mtl: every surface and texture dropped (the next title's)");
+        break;
     case HLE_OP_SET_RT:   cmd_set_rt(p); break;
     case HLE_OP_VIEWPORT: g_back.vp = *(const HleCmdViewport *)p; break;
     case HLE_OP_CLEAR:    cmd_clear(p); break;
@@ -1151,6 +1291,19 @@ void hle_back_draw_diag(void)
     hle_log("hakuX-hle-back", "mtl: %llu draws, %llu clears, %llu passes, %llu swaps",
             (unsigned long long)g_back.st.draws, (unsigned long long)g_back.st.clears,
             (unsigned long long)g_back.st.passes, (unsigned long long)g_back.st.swaps);
+    static int64_t s_t0;
+    static uint64_t s_swaps;
+    const int64_t now = g_get_monotonic_time();
+    const uint64_t us = __atomic_exchange_n(&g_gpu_us, 0, __ATOMIC_RELAXED);
+    const uint64_t max = __atomic_exchange_n(&g_gpu_max_us, 0, __ATOMIC_RELAXED);
+    if (s_t0 && now > s_t0 && g_back.st.swaps > s_swaps) {
+        const uint64_t n = g_back.st.swaps - s_swaps;
+        hle_log("hakuX-hle-back", "mtl: GPU busy %.0f%% (%.1f ms a frame, longest command "
+                "buffer %.1f ms) over %llu frames", 100.0 * us / (now - s_t0), us / 1e3 / n,
+                max / 1e3, (unsigned long long)n);
+    }
+    s_t0 = now;
+    s_swaps = g_back.st.swaps;
     hle_mtl_draw_diag();
 }
 

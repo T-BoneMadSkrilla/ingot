@@ -7,6 +7,7 @@
 #include "native/hle/hle_native.h"
 #include "native/core/mmio.h"
 #include "native/core/hostctx.h"
+#include "native/core/irq.h"
 #include "native/core/mods.h"
 #include "native/net/net.h"
 #include "native/state/save.h"
@@ -15,7 +16,10 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <sys/prctl.h>
+#include <time.h>
 #include <unistd.h>
+
+void hle_host_mem_set_dirty(uint32_t pa, uint32_t len);   /* hw/xbox/hle/host.h */
 
 #ifdef NC_VM16K
 extern NcCodeTail fex_code_tail; /* FEXCore's SharedCodeBufferManager */
@@ -111,6 +115,8 @@ static bool boot_failed(const char *why)
     return false;
 }
 
+static bool boot_title(NcCore *c, int disc_fd, bool again);
+
 bool nc_core_boot(NcCore *c, int disc_fd)
 {
     memset(c, 0, sizeof(*c));
@@ -118,26 +124,41 @@ bool nc_core_boot(NcCore *c, int disc_fd)
     /* NC_RAM_MB=128 (debug kit size): a dev switch for memory investigations. */
     const char *mb = getenv("NC_RAM_MB");
     const uint32_t ram = mb && atoi(mb) == 128 ? 128u << 20 : NC_RAM_RETAIL;
+    if (!nc_vm_init(&c->vm, ram)) {
+        return boot_failed("The emulated console couldn't be set up.");
+    }
+    return boot_title(c, disc_fd, false);
+}
+
+/* The title's half of a boot: the kernel, the XBE, its main thread. Again:
+ * an in-place reboot's (nc_core_reboot), the devices, the disc and the CPU
+ * the first boot made, reset. */
+static bool boot_title(NcCore *c, int disc_fd, bool again)
+{
     /* a savestate's kernel objects are where its boot made them (KERN v3
      * moved the pool's first range) */
     nc_kernel_pool_for(g_loadstate[0] ? nc_kern_state_kprocess(g_loadstate) : 0);
-    if (!nc_vm_init(&c->vm, ram) || !nc_kernel_init(&c->kernel, &c->vm)) {
+    if (!nc_kernel_init(&c->kernel, &c->vm)) {
         return boot_failed("The emulated console couldn't be set up.");
     }
     if (g_relaunch) {
         /* the last title's kept memory (D3D's saved display), where it was */
         nc_kernel_av_saved_set(nc_mm_keep_restore(&c->kernel));
     }
-    nc_dev_nv2a_init();
-    nc_dev_apu_init(&c->vm); /* before the catch-all, which would claim its window */
-    nc_dev_ohci_init(&c->vm);
-    nc_dev_aci_init(&c->vm);
-    nc_net_start();          /* the network the NIC finds, before it */
-    nc_dev_nvnet_init(&c->vm);
-    nc_dev_misc_init();
+    if (!again) {
+        nc_dev_nv2a_init();
+        nc_dev_apu_init(&c->vm); /* before the catch-all, which would claim its window */
+        nc_dev_ohci_init(&c->vm);
+        nc_dev_aci_init(&c->vm);
+        nc_net_start();          /* the network the NIC finds, before it */
+        nc_dev_nvnet_init(&c->vm);
+        nc_dev_misc_init();
+    }
     /* The dashboard boots with no disc (the tray empty); a title from the
-     * disc, or the dashboard relaunched from one, has it. */
-    if (disc_fd >= 0) {
+     * disc, or the dashboard relaunched from one, has it. A reboot keeps the
+     * disc open, its mods installed. */
+    if (again) {
+    } else if (disc_fd >= 0) {
         if (!nc_disc_open(&c->disc, disc_fd)) {
             close(disc_fd);
             return boot_failed("The game's file isn't an Xbox disc image.");
@@ -224,7 +245,11 @@ bool nc_core_boot(NcCore *c, int disc_fd)
         .idt_base = c->kernel.idt_va,
         .idt_limit = 0x7FF,
     };
-    c->cpu = nc_cpu_create(&cfg, c->kernel.kpcr_va);
+    if (again) {
+        nc_cpu_reset(c->cpu);
+    } else {
+        c->cpu = nc_cpu_create(&cfg, c->kernel.kpcr_va);
+    }
     if (!c->cpu) {
         return boot_failed("The emulated CPU couldn't start.");
     }
@@ -292,6 +317,113 @@ void nc_core_run(NcCore *c)
     nc_log("hakuX-native-frontier", "summary stage=%s kernel_calls=%llu first_call=%s threads=%u",
            k->first_ordinal ? "S2" : "S1", (unsigned long long)k->calls,
            first ? first->name : "-", threads);
+}
+
+static _Atomic bool g_rebooting;
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+bool nc_core_rebooting(void)
+{
+    return g_rebooting;
+}
+
+/* A file's bytes, or NULL (none); *n its size. */
+static uint8_t *slurp(const char *path, size_t *n)
+{
+    FILE *fp = fopen(path, "rb");
+    uint8_t *b = NULL;
+    if (fp && fseek(fp, 0, SEEK_END) == 0) {
+        const long len = ftell(fp);
+        b = len >= 0 ? malloc((size_t)len + 1) : NULL;
+        rewind(fp);
+        if (b && fread(b, 1, (size_t)len, fp) != (size_t)len) {
+            free(b);
+            b = NULL;
+        }
+        *n = (size_t)len;
+    }
+    if (fp) {
+        fclose(fp);
+    }
+    return b;
+}
+
+static void spill(const char *path, const uint8_t *b, size_t n)
+{
+    FILE *fp = b ? fopen(path, "wb") : NULL;
+    if (fp) {
+        fwrite(b, 1, n, fp);
+        fclose(fp);
+    }
+}
+
+static bool dev_reset(void)
+{
+    nc_dev_nv2a_reset();
+    nc_dev_apu_reset();
+    nc_dev_ohci_reset();
+    nc_dev_aci_reset();
+    nc_dev_nvnet_reset();
+    nc_irq_state_set(0, 0);
+    return true;
+}
+
+bool nc_core_reboot(NcCore *c)
+{
+    const char *on = getenv("NC_REBOOT_INPLACE");
+    char page[512], kept[512];
+    nc_kernel_relaunch_file(page, sizeof(page));
+    snprintf(kept, sizeof(kept), "%s/../kept.bin", nc_io_hdd_root());
+    if ((on && !atoi(on)) || !c->kernel.relaunch || access(page, F_OK) != 0) {
+        return false;
+    }
+    g_rebooting = true;
+    const uint64_t t0 = now_ns();
+    /* the boot takes the launch data page and the kept memory: a reboot that
+     * fails leaves them to a new process's */
+    size_t npage = 0, nkept = 0;
+    uint8_t *page_b = slurp(page, &npage), *kept_b = slurp(kept, &nkept);
+
+    nc_pause_set(true);
+    const char *who = NULL;
+    bool ok = nc_pause_quiesce(1000000000ull, &who);
+    if (!ok) {
+        nc_log("hakuX-native-frontier", "reboot: the %s device did not stop", who ? who : "?");
+    }
+    const char *err = ok ? nc_io_state_drain(&c->kernel, 2000000000ull) : NULL;
+    if (err) {
+        nc_log("hakuX-native-frontier", "reboot: %s", err);
+        ok = false;
+    }
+    if (ok) {
+        /* the GPU's work for the title done first: it writes guest RAM */
+        ok = nc_hle_reset() && nc_kernel_reset(&c->kernel) && nc_vm_reset(&c->vm) && dev_reset();
+    }
+    if (ok) {
+        g_relaunch = true;
+        g_loaded = false;
+        g_loadstate[0] = 0;
+        ok = boot_title(c, c->disc.fd, true);
+    }
+    if (ok) {
+        hle_host_mem_set_dirty(0, c->vm.ram_size);
+    } else {
+        spill(page, page_b, npage);
+        spill(kept, kept_b, nkept);
+    }
+    free(page_b);
+    free(kept_b);
+    nc_pause_set(false);
+    nc_log("hakuX-native-frontier", "reboot in place: %s in %.0f ms", ok ? "done" : "failed",
+           (now_ns() - t0) / 1e6);
+    g_rebooting = false;
+    return ok;
 }
 
 /* Hooked guest addresses: the HLE GPU's functions and device-access sites. */

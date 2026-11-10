@@ -24,6 +24,7 @@ bool g_hle_msl;
     "#define discard discard_fragment()\n" \
     "#define inversesqrt rsqrt\n#define dFdx dfdx\n#define dFdy dfdy\n" \
     "#define nonuniformEXT(x) (x)\n#define subpassLoad(x) (x)\n" \
+    "#define HLE_SL(s) (uint(s) | (uint(s) + 1u) << 16)\n" \
     "inline float3x3 mat3(float3 a, float3 b, float3 c) { return float3x3(a, b, c); }\n" \
     "inline float3x3 mat3(float4x4 m) { return float3x3(m[0].xyz, m[1].xyz, m[2].xyz); }\n" \
     "inline float uintBitsToFloat(uint x) { return as_type<float>(x); }\n" \
@@ -260,4 +261,21 @@ size_t hle_msl_entry(const HleMsl *m, char *buf, size_t cap)
         vs_entry(&b, m);
     }
     return b.overflow ? 0 : b.len;
+}
+
+void hle_msl_fold_slots(char *src, size_t len)
+{
+    static const char k_from[] = "pc.tex[", k_to[] = "HLE_SL(";
+    const size_t n = sizeof(k_from) - 1;
+    for (size_t i = 0; i + n <= len; i++) {
+        if (memcmp(src + i, k_from, n)) {
+            continue;
+        }
+        char *close = memchr(src + i + n, ']', len - i - n);
+        if (!close) {
+            break;
+        }
+        memcpy(src + i, k_to, n);
+        *close = ')';
+    }
 }

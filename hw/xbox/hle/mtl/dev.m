@@ -11,7 +11,7 @@
 #include "hw/xbox/hle/pb/pbres.h"
 
 HleMtl g_mtl;
-bool g_mtl_pipe_async;
+bool g_mtl_pipe_async, g_mtl_pipe_prebuild;
 static HleArena g_arena_alloc, g_land_alloc;
 static bool g_lost, g_ready;
 
@@ -249,13 +249,14 @@ bool hle_gpu_vb_align_words(void)
     return true;
 }
 
-/* Asynchronous builds (draw.m pipeline); no prebuild: the system's shader
- * cache keeps the last runs' */
+/* Asynchronous builds (draw.m pipeline) and the recorded pipelines' before
+ * the game (hle_mtl_draw_prebuild) */
 void hle_pipe_set_options(bool async, bool prebuild)
 {
-    (void)prebuild;
     const char *e = getenv("HAKUX_HLE_ASYNCPIPE");
     g_mtl_pipe_async = e && *e ? atoi(e) != 0 : async;
+    e = getenv("HAKUX_HLE_PREBUILD");
+    g_mtl_pipe_prebuild = e && *e ? atoi(e) != 0 : prebuild;
 }
 
 void hle_pipe_progress(uint32_t *done, uint32_t *total)

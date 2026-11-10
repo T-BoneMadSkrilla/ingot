@@ -162,6 +162,11 @@ static struct {
     uint32_t site, stub;
 } g_xmv_stubs[8];
 
+void nc_fixups_reset(void)
+{
+    memset(g_xmv_stubs, 0, sizeof(g_xmv_stubs));
+}
+
 static uint32_t rel_target(NcKernel *k, uint32_t call)
 {
     return call + 5 + nc_vm_rd32(k->vm, call + 1);

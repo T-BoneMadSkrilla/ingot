@@ -1812,6 +1812,11 @@ void hle_back_set_frame_hook(const HleFrameHook *hook)
     g_fh.hook = hook ? *hook : (HleFrameHook){ 0 };
 }
 
+/* the prebuild is the back end's start's (hle_draw_prebuild) */
+void hle_back_title(void)
+{
+}
+
 void hle_back_save_caches(void)
 {
     hle_pcache_save(true);
