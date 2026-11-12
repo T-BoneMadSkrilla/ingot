@@ -69,7 +69,12 @@ static uint32_t g_pool_at;
 
 void nc_kernel_pool_for(uint32_t kprocess)
 {
-    g_pool_at = kprocess >= NC_CONTIG_WINDOW ? (kprocess - NC_CONTIG_WINDOW) & ~(POOL_SIZE - 1) : 0;
+    const uint32_t pa = kprocess - NC_CONTIG_WINDOW;
+    /* POOL_BASE isn't 64 KiB-aligned (0x24000): the rounding below would
+     * miss it */
+    g_pool_at = kprocess < NC_CONTIG_WINDOW                ? 0
+              : pa >= POOL_BASE && pa < POOL_BASE + POOL_SIZE ? POOL_BASE
+                                                               : pa & ~(POOL_SIZE - 1);
 }
 
 const NcKExport *nc_kernel_export(unsigned ordinal)

@@ -15,7 +15,7 @@ out="${1:-$src/../build}"
 core_build="${INGOT_CORE_BUILD:-$out/mac-metal}"
 work="$out/ingot"
 app="$out/Ingot.app"
-version="1.0.0"
+version="1.0.1"
 
 mkdir -p "$work"
 if [ ! -f "$core_build/build.ninja" ]; then

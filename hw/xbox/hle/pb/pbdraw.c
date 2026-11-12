@@ -262,7 +262,13 @@ static struct {
     PbTex *tex;                         /* TEX_SLOTS */
     unsigned ntex;
     uint64_t tex_defs, tex_flushes;
+    /* hle_pbd_tex_diag: the textures checked and defined again since its
+     * last log, why (TEXW_*), and those defined most */
+    uint64_t tex_checks, tex_why[5];
+    struct { uint32_t pa, bytes, fmt, n; } tex_top[64];
 } g_pd;
+
+enum { TEXW_NEW, TEXW_MID, TEXW_FIRST, TEXW_LAST, TEXW_PAL };
 
 #define R(m) (g_pd.r[(m) >> 2])
 static bool coh_managed(const PbObj *o, uint32_t *len);
@@ -2586,16 +2592,63 @@ static bool edge_dirty(uint32_t page)
     return hle_host_mem_dirty((uint32_t)(hle_ram_addr_base() + page));
 }
 
-static bool tex_written(const PbTex *t)
+/* Written since its definition: 1 << TEXW_MID / _FIRST / _LAST, the pages
+ * that say so; 0 none */
+static unsigned tex_written(const PbTex *t)
 {
     if (!t->bytes) {
-        return false;
+        return 0;
     }
     const uint32_t lo = t->pa, hi = lo + t->bytes, p0 = lo & ~4095u, pl = (hi - 1) & ~4095u;
     const bool mid = pl > p0 + 4096 && hle_mem_written(p0 + 4096, pl - p0 - 4096);
     const bool first = edge_dirty(p0) && span_hash(lo, MIN(hi, p0 + 4096) - lo) != t->edge_hash[0];
     const bool last = pl != p0 && edge_dirty(pl) && span_hash(pl, hi - pl) != t->edge_hash[1];
-    return mid || first || last;
+    return mid << TEXW_MID | first << TEXW_FIRST | last << TEXW_LAST;
+}
+
+static void tex_redefined(uint32_t pa, uint32_t bytes, uint32_t fmt, unsigned why)
+{
+    for (unsigned w = 0; w < 5; w++) {
+        g_pd.tex_why[w] += (why >> w) & 1;
+    }
+    unsigned i = (pa >> 7) % 64u;
+    for (unsigned k = 0; k < 64 && g_pd.tex_top[i].n && g_pd.tex_top[i].pa != pa; k++) {
+        i = (i + 1) % 64u;
+    }
+    if (!g_pd.tex_top[i].n || g_pd.tex_top[i].pa == pa) {
+        g_pd.tex_top[i].pa = pa;
+        g_pd.tex_top[i].bytes = bytes;
+        g_pd.tex_top[i].fmt = fmt;
+        g_pd.tex_top[i].n++;
+    }
+}
+
+void hle_pbd_tex_diag(void)
+{
+    char top[512] = "";
+    int o = 0;
+    for (unsigned r = 0; r < 6; r++) {
+        unsigned b = 64;
+        for (unsigned i = 0; i < 64; i++) {
+            if (g_pd.tex_top[i].n && (b == 64 || g_pd.tex_top[i].n > g_pd.tex_top[b].n)) {
+                b = i;
+            }
+        }
+        if (b == 64) {
+            break;
+        }
+        o += snprintf(top + o, sizeof(top) - (size_t)o, " %08x+%x fmt %08x x%u", g_pd.tex_top[b].pa,
+                      g_pd.tex_top[b].bytes, g_pd.tex_top[b].fmt, g_pd.tex_top[b].n);
+        g_pd.tex_top[b].n = 0;
+    }
+    hle_log("hakuX-hle-pb", "textures: %u in the table, %llu checked; defined again: %llu new, %llu "
+            "inner pages written, %llu first page, %llu last page, %llu palette | most:%s", g_pd.ntex,
+            (unsigned long long)g_pd.tex_checks, (unsigned long long)g_pd.tex_why[TEXW_NEW],
+            (unsigned long long)g_pd.tex_why[TEXW_MID], (unsigned long long)g_pd.tex_why[TEXW_FIRST],
+            (unsigned long long)g_pd.tex_why[TEXW_LAST], (unsigned long long)g_pd.tex_why[TEXW_PAL], top);
+    g_pd.tex_checks = 0;
+    memset(g_pd.tex_why, 0, sizeof(g_pd.tex_why));
+    memset(g_pd.tex_top, 0, sizeof(g_pd.tex_top));
 }
 
 /* Palettes hashed, by address (direct-mapped), their bytes kept for the
@@ -2754,6 +2807,7 @@ static uint32_t texture(unsigned s, bool *unset, bool *lin)
         t = &g_pd.tex[h];
     }
     bool redefine = false;
+    unsigned why = 0;
     if (!t->id) {
         if (g_pd.ntex >= TEX_MAX) {
             tex_evict();
@@ -2764,6 +2818,7 @@ static uint32_t texture(unsigned s, bool *unset, bool *lin)
         t->checked = g_pd.epoch;
         g_pd.ntex++;
         redefine = true;
+        why = 1u << TEXW_NEW;
     } else if (t->ok) {
         /* texels written since, checked at every use: the decoder copies a
          * texture's texels when it decodes the draw, before any later fence
@@ -2771,7 +2826,9 @@ static uint32_t texture(unsigned s, bool *unset, bool *lin)
          * string into one texture between its draws) */
         t->checked = g_pd.epoch;
         coh_pend_wait(t->pa, t->bytes);             /* a copy queued into it lands first */
-        redefine = tex_written(t);
+        why = tex_written(t);
+        redefine = why != 0;
+        g_pd.tex_checks++;
     }
     static uint32_t pal[256];
     uint32_t npal = 0, pal_hash = 0;
@@ -2805,7 +2862,10 @@ static uint32_t texture(unsigned s, bool *unset, bool *lin)
         } else {
             npal = 0;
         }
-        redefine |= t->ok && pal_hash != t->pal_hash;
+        if (t->ok && pal_hash != t->pal_hash) {
+            redefine = true;
+            why |= 1u << TEXW_PAL;
+        }
     }
     if (redefine && pal_mem) {
         memcpy(pal, pal_mem, 4 * npal);
@@ -2823,6 +2883,7 @@ static uint32_t texture(unsigned s, bool *unset, bool *lin)
             tex_edges_set(t);
             mem_supersedes(pa, bytes);
             g_pd.tex_defs++;
+            tex_redefined(pa, bytes, fmt, why);
         }
     }
     return t->ok ? t->id : 0;

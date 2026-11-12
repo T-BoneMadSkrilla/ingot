@@ -132,6 +132,8 @@ bool hle_pbd_keep_wait(uint64_t timeout_ns);
 /* debug: what the decode thread waits for in a draw ("arena", "ring"), or NULL */
 const char *hle_pbd_phase(void);
 void hle_pbd_draw_counts(uint64_t *draws, uint64_t *ff, uint64_t *skipped, uint64_t *tex_defs);
+/* The textures checked and defined again since the last call, and why (logged) */
+void hle_pbd_tex_diag(void);
 /* Visibility tests ended, and the submit boundaries they needed of their own */
 void hle_pbd_vis_counts(uint64_t *tests, uint64_t *kicks);
 /* debug (HAKUX_HLE_PB_NOVIS=1): no occlusion queries; visibility tests

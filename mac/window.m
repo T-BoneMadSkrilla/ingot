@@ -23,7 +23,8 @@
  * areas) ends the core's run; the process execs itself again with relaunch,
  * and the new window opens where the old one was (INGOT_FRAME), full screen
  * if it was, showing the old one's last frame (INGOT_COVER) until the game
- * presents.
+ * presents. Load State starts the process again the same way, booting the
+ * game's saved state (loadstate=).
  */
 #import <Cocoa/Cocoa.h>
 #import <GameController/GameController.h>
@@ -102,11 +103,19 @@ static void put_player(GCController *c, unsigned p)
 @interface NcDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate>
 @end
 
-@implementation NcDelegate
-/* Save State: the running game to ~/Library/Application Support/Ingot/States/
- * (the folder also holds the states' shared blobs), off the main thread;
- * the window's title says how it went. */
-- (void)saveState:(id)sender
+static void reexec(const char *state);
+
+static void note(NSString *text)
+{
+    [g_note release];                   /* (no ARC here) */
+    g_note = [text copy];
+    g_note_until = CACurrentMediaTime() + 4.0;
+}
+
+/* The running game's state file: ~/Library/Application Support/Ingot/States/
+ * (the folder also holds the states' shared blobs), named for the window's
+ * title. */
+static NSString *state_path(void)
 {
     NSString *title = NSApp.windows.firstObject.title ?: @"game";
     NSString *name = [[title componentsSeparatedByString:@" — "].firstObject
@@ -117,14 +126,39 @@ static void put_player(GCController *c, unsigned p)
         URLByAppendingPathComponent:@"Ingot/States"
                         isDirectory:YES];
     [NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *path = [dir URLByAppendingPathComponent:[name stringByAppendingPathExtension:@"hxs"]].path;
+    return [dir URLByAppendingPathComponent:[name stringByAppendingPathExtension:@"hxs"]].path;
+}
+
+@implementation NcDelegate
+/* Save State: the running game to its state file, off the main thread; the
+ * window's title says how it went. */
+- (void)saveState:(id)sender
+{
+    NSString *path = state_path();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         const char *err = nc_state_save(path.fileSystemRepresentation);
         NSLog(@"Save State: %@: %s", path, err ? err : "saved");
-        NSString *note = err ? [NSString stringWithFormat:@"couldn't save state: %s", err] : @"state saved";
+        NSString *text = err ? [NSString stringWithFormat:@"couldn't save state: %s", err] : @"state saved";
         dispatch_async(dispatch_get_main_queue(), ^{
-            g_note = note;
-            g_note_until = CACurrentMediaTime() + 4.0;
+            note(text);
+        });
+    });
+}
+/* Load State: the game's saved state, the process started again in its
+ * place booting it (a state loads only at boot) */
+- (void)loadState:(id)sender
+{
+    NSString *path = state_path();
+    if (![NSFileManager.defaultManager fileExistsAtPath:path]) {
+        note(@"no saved state for this game yet");
+        return;
+    }
+    NSLog(@"Load State: %@", path);
+    const char *state = strdup(path.fileSystemRepresentation);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        reexec(state);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            note(@"couldn't load state");
         });
     });
 }
@@ -329,8 +363,10 @@ static bool write_cover(const char *path)
 }
 
 /* The core again in this process's place, booting what the relaunch file
- * names; returns only if it couldn't (the launcher starts it then). */
-static void relaunch(void)
+ * names, or the savestate (state); returns only if it couldn't (for a
+ * relaunch the launcher starts it then). Off the main thread: it yields the
+ * app's activation through the main loop. */
+static void reexec(const char *state)
 {
     char cover[512];
     snprintf(cover, sizeof(cover), "%s/ingot-cover-%d.rgba", getenv("TMPDIR") ?: "/tmp", getpid());
@@ -346,14 +382,19 @@ static void relaunch(void)
 
     const int argc = *_NSGetArgc();
     char **argv = *_NSGetArgv();
-    char *args[argc + 2];
+    char *args[argc + 2], load[PATH_MAX + 16];
     int n = 0;
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "relaunch")) {
+        if (strcmp(argv[i], "relaunch") && strncmp(argv[i], "loadstate=", 10)) {
             args[n++] = argv[i];
         }
     }
-    args[n++] = "relaunch";
+    if (state) {
+        snprintf(load, sizeof(load), "loadstate=%s", state);
+        args[n++] = load;
+    } else {
+        args[n++] = "relaunch";
+    }
     args[n] = NULL;
 
     char exe[PATH_MAX];
@@ -381,7 +422,7 @@ static void *core_thread(void *arg)
     char file[512];
     nc_kernel_relaunch_file(file, sizeof(file));
     if (status == 10 && access(file, F_OK) == 0) {
-        relaunch();
+        reexec(NULL);
     }
     _exit(status);
 }
@@ -395,6 +436,7 @@ static void add_menus(NSString *app_name, NcDelegate *delegate)
     [app_menu addItemWithTitle:[@"Hide " stringByAppendingString:app_name] action:@selector(hide:) keyEquivalent:@"h"];
     [app_menu addItem:[NSMenuItem separatorItem]];
     [app_menu addItemWithTitle:@"Save State" action:@selector(saveState:) keyEquivalent:@"s"].target = delegate;
+    [app_menu addItemWithTitle:@"Load State" action:@selector(loadState:) keyEquivalent:@"l"].target = delegate;
     [app_menu addItem:[NSMenuItem separatorItem]];
     [app_menu addItemWithTitle:@"Quit Game" action:@selector(terminate:) keyEquivalent:@"q"];
     app_item.submenu = app_menu;

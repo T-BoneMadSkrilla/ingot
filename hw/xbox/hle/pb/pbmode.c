@@ -1636,6 +1636,7 @@ void hle_pb_diag(void)
     unsigned objs;
     hle_pbd_counts(&clears, &swaps, &objs, &rt_uploads);
     hle_pbd_draw_counts(&draws, &ff, &skipped, &tex_defs);
+    hle_pbd_tex_diag();
     uint64_t vis_tests, vis_kicks;
     hle_pbd_vis_counts(&vis_tests, &vis_kicks);
     const HleDispStats ds = hle_disp_stats();
